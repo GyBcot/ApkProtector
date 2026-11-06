@@ -1,5 +1,7 @@
 package com.rscoders.core.crypto
 
+import com.rscoders.core.sign.CertFingerprint
+
 object ShellPatcher {
     private val MAGIC = byteArrayOf(
         0xCA.toByte(), 0x1B, 0x0B, 0x1E, 0x5E, 0xC0.toByte(), 0xDE.toByte(), 0x4B,
@@ -16,6 +18,11 @@ object ShellPatcher {
         val out = soBytes.copyOf()
         System.arraycopy(kek, 0, out, at + MAGIC.size, KEK_LEN)
         return out
+    }
+
+    fun patchWithCertBinding(soBytes: ByteArray, staticKek: ByteArray, certSha256Hex: String): ByteArray {
+        val boundKek = CertFingerprint.deriveKekWithCert(staticKek, certSha256Hex)
+        return patch(soBytes, boundKek)
     }
 
     private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
