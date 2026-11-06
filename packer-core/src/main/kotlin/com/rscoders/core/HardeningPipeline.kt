@@ -101,7 +101,6 @@ class HardeningPipeline(
                 appendLine("guard.logSuppression=${p.logSuppression}")
                 appendLine("guard.protectedAssets=${protectedNames.joinToString(",")}")
                 appendLine("guard.protectedSo=${soNames.joinToString(",")}")
-                appendLine("guard.kekBound=${certSha != null}")
             }.toByteArray()
             steps += StepReport(
                 "guard",
@@ -110,7 +109,7 @@ class HardeningPipeline(
                     "debug=${p.debuggingDetection} ptrace=${p.antiPtrace} frida=${p.antiReverseTools} " +
                     "root=${p.rootDetection} emu=${p.emulatorDetection} flagsecure=${p.screenCapturePrevention} " +
                     "hijack=${p.antiHijacking} dblopen=${p.doubleOpenDetection} a11y=${p.accessibilityDetection} " +
-                    "logsuppress=${p.logSuppression} kekbound=${certSha != null}",
+                    "logsuppress=${p.logSuppression}",
             )
 
             val propsKey = derivePropsKey(kek)
@@ -122,19 +121,9 @@ class HardeningPipeline(
                 put("assets/rscoders.bin", encryptedProps)
                 putAll(encAssets)
             }
-
             val stored = config.nativeShells.mapKeys { (abi, _) -> "lib/$abi/librscoders.so" }
-                .mapValues { (_, so) ->
-                    if (certSha != null) {
-                        ShellPatcher.patchWithCertBinding(so.readBytes(), kek, certSha)
-                    } else {
-                        ShellPatcher.patch(so.readBytes(), kek)
-                    }
-                } + soStored
-
-            if (certSha != null && config.nativeShells.isNotEmpty()) {
-                steps += StepReport("kek-binding", "KEK bound to certSha256=${certSha.take(16)}…")
-            }
+                .mapValues { (_, so) -> ShellPatcher.patch(so.readBytes(), kek) } +
+                soStored
 
             val unsigned = work.resolve("hardened-unsigned.apk")
             repackager.repackage(
