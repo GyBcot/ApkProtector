@@ -8,7 +8,9 @@ add_library(rscoders SHARED src/rscoders_shell.cpp)
 
 find_library(log-lib log)
 find_library(android-lib android)
+find_library(ssl-lib ssl)
+find_library(crypto-lib crypto)
 
-target_link_libraries(rscoders ${log-lib} ${android-lib} z)
+target_link_libraries(rscoders ${log-lib} ${android-lib} ${ssl-lib} ${crypto-lib} z)
 
 target_link_options(rscoders PRIVATE $<$<CONFIG:Release>:-s>)
