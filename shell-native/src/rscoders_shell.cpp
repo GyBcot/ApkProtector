@@ -326,73 +326,96 @@ void installAntiPtrace() {
 }
 
 void injectDex(JNIEnv* env, jobject context, const std::vector<std::vector<uint8_t>>& dexBlobs) {
-    jclass bbClass = env->FindClass("java/nio/ByteBuffer");
-    jmethodID wrapMethod = env->GetStaticMethodID(bbClass, "wrap", "([B)Ljava/nio/ByteBuffer;");
+    jclass ctxClass = env->GetObjectClass(context);
+    jclass fileClass = env->FindClass("java/io/File");
+    jclass classCls = env->FindClass("java/lang/Class");
+    jclass fieldCls = env->FindClass("java/lang/reflect/Field");
 
-    jint count = static_cast<jint>(dexBlobs.size());
-    jobjectArray buffers = env->NewObjectArray(count, bbClass, nullptr);
-    for (jint i = 0; i < count; i++) {
-        jbyteArray arr = env->NewByteArray(static_cast<jsize>(dexBlobs[i].size()));
-        env->SetByteArrayRegion(arr, 0, static_cast<jsize>(dexBlobs[i].size()),
-            reinterpret_cast<const jbyte*>(dexBlobs[i].data()));
-        jobject bb = env->CallStaticObjectMethod(bbClass, wrapMethod, arr);
-        env->SetObjectArrayElement(buffers, i, bb);
-        env->DeleteLocalRef(arr);
-        env->DeleteLocalRef(bb);
+    jmethodID getCacheDir = env->GetMethodID(ctxClass, "getCacheDir", "()Ljava/io/File;");
+    jmethodID getAbsPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
+    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
+    jmethodID setAccessible = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
+    jmethodID fieldGet = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID fieldSet = env->GetMethodID(fieldCls, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
+
+    jobject cacheDir = env->CallObjectMethod(context, getCacheDir);
+    jstring jCachePath = static_cast<jstring>(env->CallObjectMethod(cacheDir, getAbsPath));
+    const char* cacheChars = env->GetStringUTFChars(jCachePath, nullptr);
+    std::string cacheDirStr(cacheChars);
+    env->ReleaseStringUTFChars(jCachePath, cacheChars);
+
+    std::string dexPath;
+    std::vector<std::string> tempFiles;
+    for (int i = 0; i < (int)dexBlobs.size(); i++) {
+        std::string path = cacheDirStr + "/rc_" + std::to_string(i) + ".dex";
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) { fwrite(dexBlobs[i].data(), 1, dexBlobs[i].size(), f); fclose(f); }
+        if (!dexPath.empty()) dexPath += ":";
+        dexPath += path;
+        tempFiles.push_back(path);
     }
 
-    jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
     jobject appLoader = env->CallObjectMethod(context, getClassLoader);
-    jclass loaderClass = env->GetObjectClass(appLoader);
-    jmethodID getParent = env->GetMethodID(loaderClass, "getParent", "()Ljava/lang/ClassLoader;");
-    jobject parentLoader = env->CallObjectMethod(appLoader, getParent);
 
-    jclass inMemClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-    jmethodID inMemCtor = env->GetMethodID(inMemClass, "<init>",
-        "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-    jobject decryptedLoader = env->NewObject(inMemClass, inMemCtor, buffers, parentLoader);
+    jclass dexLoaderClass = env->FindClass("dalvik/system/DexClassLoader");
+    jmethodID dexLoaderCtor = env->GetMethodID(dexLoaderClass, "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+    jstring jDexPath = env->NewStringUTF(dexPath.c_str());
+    jstring jOptDir = env->NewStringUTF(cacheDirStr.c_str());
+    jobject tempLoader = env->NewObject(dexLoaderClass, dexLoaderCtor,
+        jDexPath, jOptDir, nullptr, appLoader);
+    env->DeleteLocalRef(jDexPath);
+    env->DeleteLocalRef(jOptDir);
 
     jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
-    jfieldID pathListField = env->GetFieldID(baseDexClass, "pathList",
-        "Ldalvik/system/DexPathList;");
+    jstring pathListName = env->NewStringUTF("pathList");
+    jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
+    env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
+    env->DeleteLocalRef(pathListName);
 
-    jobject appPathList = env->GetObjectField(appLoader, pathListField);
-    jobject decPathList = env->GetObjectField(decryptedLoader, pathListField);
+    jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
+    jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
+    env->DeleteLocalRef(pathListField);
 
     jclass dexPathListClass = env->GetObjectClass(appPathList);
-    jfieldID elementsField = env->GetFieldID(dexPathListClass, "dexElements",
-        "[Ldalvik/system/DexPathList$Element;");
+    jstring elemName = env->NewStringUTF("dexElements");
+    jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
+    env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
+    env->DeleteLocalRef(elemName);
 
-    jobjectArray appElements = static_cast<jobjectArray>(env->GetObjectField(appPathList, elementsField));
-    jobjectArray decElements = static_cast<jobjectArray>(env->GetObjectField(decPathList, elementsField));
+    jobjectArray appElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, appPathList));
+    jobjectArray tempElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, tempPathList));
 
-    jint appLen = env->GetArrayLength(appElements);
-    jint decLen = env->GetArrayLength(decElements);
-
+    jint appLen = env->GetArrayLength(appElems);
+    jint tempLen = env->GetArrayLength(tempElems);
     jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
-    jobjectArray merged = env->NewObjectArray(appLen + decLen, elemClass, nullptr);
+    jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
     for (jint i = 0; i < appLen; i++)
-        env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElements, i));
-    for (jint i = 0; i < decLen; i++)
-        env->SetObjectArrayElement(merged, appLen + i, env->GetObjectArrayElement(decElements, i));
+        env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
+    for (jint i = 0; i < tempLen; i++)
+        env->SetObjectArrayElement(merged, appLen + i, env->GetObjectArrayElement(tempElems, i));
+    env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
 
-    env->SetObjectField(appPathList, elementsField, merged);
+    for (auto& p : tempFiles) remove(p.c_str());
 
-    env->DeleteLocalRef(bbClass);
-    env->DeleteLocalRef(buffers);
     env->DeleteLocalRef(ctxClass);
+    env->DeleteLocalRef(fileClass);
+    env->DeleteLocalRef(classCls);
+    env->DeleteLocalRef(fieldCls);
+    env->DeleteLocalRef(cacheDir);
+    env->DeleteLocalRef(jCachePath);
     env->DeleteLocalRef(appLoader);
-    env->DeleteLocalRef(loaderClass);
-    env->DeleteLocalRef(parentLoader);
-    env->DeleteLocalRef(inMemClass);
-    env->DeleteLocalRef(decryptedLoader);
+    env->DeleteLocalRef(dexLoaderClass);
+    env->DeleteLocalRef(tempLoader);
     env->DeleteLocalRef(baseDexClass);
     env->DeleteLocalRef(appPathList);
-    env->DeleteLocalRef(decPathList);
+    env->DeleteLocalRef(tempPathList);
     env->DeleteLocalRef(dexPathListClass);
-    env->DeleteLocalRef(appElements);
-    env->DeleteLocalRef(decElements);
+    env->DeleteLocalRef(elemField);
+    env->DeleteLocalRef(appElems);
+    env->DeleteLocalRef(tempElems);
     env->DeleteLocalRef(elemClass);
     env->DeleteLocalRef(merged);
 }
