@@ -88,6 +88,7 @@ jobs:
           NDK_VER="$(ls $ANDROID_HOME/ndk | sort -V | tail -1)"
           NDK="$ANDROID_HOME/ndk/$NDK_VER"
           TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
           SDK_CMAKE="$(ls -d $ANDROID_HOME/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
           CMAKE="${SDK_CMAKE:+$SDK_CMAKE/}cmake"
@@ -95,9 +96,15 @@ jobs:
           for ABI in arm64-v8a armeabi-v7a; do
             if [ "$ABI" = "arm64-v8a" ]; then
               OPENSSL_LIB="$OPENSSL_DIR/arm64-v8a"
+              TRIPLE="aarch64-linux-android"
             else
               OPENSSL_LIB="$OPENSSL_DIR/armeabi-v7a"
+              TRIPLE="arm-linux-androideabi"
             fi
+
+            cp "$OPENSSL_LIB/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
+            cp "$OPENSSL_LIB/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
+            cp -rn "$OPENSSL_DIR/include/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
 
             OUT="shell-native/build/$ABI"
             mkdir -p "$OUT"
@@ -107,10 +114,6 @@ jobs:
               -DANDROID_ABI="$ABI" \
               -DANDROID_PLATFORM="android-21" \
               -DCMAKE_BUILD_TYPE=Release \
-              -DOPENSSL_ROOT_DIR="$OPENSSL_DIR" \
-              -DOPENSSL_INCLUDE_DIR="$OPENSSL_DIR/include" \
-              -DOPENSSL_SSL_LIBRARY="$OPENSSL_LIB/libssl.a" \
-              -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_LIB/libcrypto.a" \
               -GNinja
 
             $CMAKE --build "$OUT/.cmake"
