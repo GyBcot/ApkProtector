@@ -36,6 +36,9 @@ volatile uint8_t g_kekBlob[48] = {
 
 namespace {
 
+void tamper(const char* reason);
+void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedSha);
+
 constexpr int KEK_LEN = 32;
 static volatile bool g_screenCapturePrevention = false;
 static volatile bool g_antiHijacking = false;
@@ -332,6 +335,12 @@ void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHe
     std::vector<uint8_t> certDer(p + certStart, p + certStart + certTotalLen);
     std::string actual = bytesToHex(sha256Digest(certDer));
     if (actual != expectedHex) tamper("signature-mismatch");
+}
+
+void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedSha) {
+    if (expectedSha.empty()) return;
+    std::string actual = bytesToHex(sha256Digest(payload));
+    if (actual != expectedSha) tamper("integrity-mismatch");
 }
 
 std::vector<std::vector<uint8_t>> unpackPayload(const std::vector<uint8_t>& payload) {
