@@ -54,6 +54,195 @@ void loadKek(uint8_t out[32]) {
     for (int i = 0; i < 32; ++i) out[i] = g_kekBlob[16 + i];
 }
 
+static uint32_t readU32LE(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint16_t readU16LE(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static std::string getApkPathFromMaps() {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(".apk") != std::string::npos) {
+            auto pos = line.rfind(' ');
+            if (pos != std::string::npos) {
+                std::string path = line.substr(pos + 1);
+                if (!path.empty() && path.back() == '\n') path.pop_back();
+                if (!path.empty()) return path;
+            }
+        }
+    }
+    return "";
+}
+
+static std::vector<uint8_t> inflateRaw(const std::vector<uint8_t>& data) {
+    z_stream zs{};
+    inflateInit2(&zs, -15);
+    zs.next_in = const_cast<Bytef*>(data.data());
+    zs.avail_in = static_cast<uInt>(data.size());
+    std::vector<uint8_t> out;
+    uint8_t buf[65536];
+    int ret;
+    do {
+        zs.next_out = buf;
+        zs.avail_out = sizeof(buf);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) break;
+        out.insert(out.end(), buf, buf + sizeof(buf) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+    inflateEnd(&zs);
+    return out;
+}
+
+static std::vector<uint8_t> readCertRsaFromApk(const std::string& apkPath) {
+    int fd = open(apkPath.c_str(), O_RDONLY);
+    if (fd < 0) return {};
+
+    off_t fileSize = lseek(fd, 0, SEEK_END);
+    if (fileSize < 22) { close(fd); return {}; }
+
+    uint8_t eocd[22];
+    off_t searchStart = fileSize - 22;
+    bool found = false;
+    while (searchStart >= 0) {
+        lseek(fd, searchStart, SEEK_SET);
+        if (read(fd, eocd, 22) != 22) break;
+        if (eocd[0] == 0x50 && eocd[1] == 0x4B && eocd[2] == 0x05 && eocd[3] == 0x06) {
+            found = true;
+            break;
+        }
+        searchStart--;
+    }
+    if (!found) { close(fd); return {}; }
+
+    uint32_t cdSize   = readU32LE(eocd + 12);
+    uint32_t cdOffset = readU32LE(eocd + 16);
+
+    std::vector<uint8_t> cd(cdSize);
+    lseek(fd, cdOffset, SEEK_SET);
+    if ((size_t)read(fd, cd.data(), cdSize) != cdSize) { close(fd); return {}; }
+
+    size_t pos = 0;
+    while (pos + 46 <= cdSize) {
+        if (readU32LE(cd.data() + pos) != 0x02014B50) break;
+        uint16_t method     = readU16LE(cd.data() + pos + 10);
+        uint32_t compSize   = readU32LE(cd.data() + pos + 20);
+        uint16_t fnLen      = readU16LE(cd.data() + pos + 28);
+        uint16_t extraLen   = readU16LE(cd.data() + pos + 30);
+        uint16_t commentLen = readU16LE(cd.data() + pos + 32);
+        uint32_t localOff   = readU32LE(cd.data() + pos + 42);
+
+        std::string name(cd.begin() + pos + 46, cd.begin() + pos + 46 + fnLen);
+
+        bool isCert = false;
+        if (name.size() >= 9 && name.substr(0, 9) == "META-INF/") {
+            std::string upper = name;
+            for (auto& c : upper) if (c >= 'a' && c <= 'z') c -= 32;
+            if (upper.size() >= 4) {
+                std::string ext4 = upper.substr(upper.size() - 4);
+                std::string ext3 = upper.size() >= 3 ? upper.substr(upper.size() - 3) : "";
+                if (ext4 == ".RSA" || ext4 == ".DSA" || ext3 == ".EC") isCert = true;
+            }
+        }
+
+        if (isCert) {
+            uint8_t lhBuf[30];
+            lseek(fd, localOff, SEEK_SET);
+            if (read(fd, lhBuf, 30) == 30 && readU32LE(lhBuf) == 0x04034B50) {
+                uint16_t lhExtraLen = readU16LE(lhBuf + 28);
+                uint16_t lhFnLen    = readU16LE(lhBuf + 26);
+                off_t dataOff = localOff + 30 + lhFnLen + lhExtraLen;
+                lseek(fd, dataOff, SEEK_SET);
+                std::vector<uint8_t> compData(compSize);
+                if ((size_t)read(fd, compData.data(), compSize) == compSize) {
+                    close(fd);
+                    if (method == 0) return compData;
+                    return inflateRaw(compData);
+                }
+            }
+            break;
+        }
+
+        pos += 46 + fnLen + extraLen + commentLen;
+    }
+
+    close(fd);
+    return {};
+}
+
+static void sha256Native(const uint8_t* data, size_t len, uint8_t out[32]) {
+    uint32_t h[8] = {
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+    };
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+
+    uint64_t bitLen = (uint64_t)len * 8;
+    std::vector<uint8_t> msg(data, data + len);
+    msg.push_back(0x80);
+    while (msg.size() % 64 != 56) msg.push_back(0);
+    for (int i = 7; i >= 0; i--) msg.push_back((uint8_t)(bitLen >> (8 * i)));
+
+    for (size_t i = 0; i < msg.size(); i += 64) {
+        uint32_t w[64];
+        for (int j = 0; j < 16; j++) {
+            w[j] = ((uint32_t)msg[i+j*4] << 24) | ((uint32_t)msg[i+j*4+1] << 16) |
+                   ((uint32_t)msg[i+j*4+2] << 8) | msg[i+j*4+3];
+        }
+        for (int j = 16; j < 64; j++) {
+            uint32_t s0 = rotr(w[j-15],7) ^ rotr(w[j-15],18) ^ (w[j-15] >> 3);
+            uint32_t s1 = rotr(w[j-2],17) ^ rotr(w[j-2],19) ^ (w[j-2] >> 10);
+            w[j] = w[j-16] + s0 + w[j-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int j = 0; j < 64; j++) {
+            uint32_t S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t temp1 = hh + S1 + ch + K[j] + w[j];
+            uint32_t S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t temp2 = S0 + maj;
+            hh=g; g=f; f=e; e=d+temp1; d=c; c=b; b=a; a=temp1+temp2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
+        h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    for (int i = 0; i < 8; i++) {
+        out[i*4+0] = (h[i] >> 24) & 0xFF;
+        out[i*4+1] = (h[i] >> 16) & 0xFF;
+        out[i*4+2] = (h[i] >>  8) & 0xFF;
+        out[i*4+3] =  h[i]        & 0xFF;
+    }
+}
+
+static std::string certHashFromApkNative(const std::string& apkPath) {
+    std::vector<uint8_t> certDer = readCertRsaFromApk(apkPath);
+    if (certDer.empty()) return "";
+    uint8_t digest[32];
+    sha256Native(certDer.data(), certDer.size(), digest);
+    static const char hex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (int i = 0; i < 32; i++) {
+        s += hex[digest[i] >> 4];
+        s += hex[digest[i] & 0xF];
+    }
+    return s;
+}
+
 std::vector<uint8_t> readAssetNative(JNIEnv* env, jobject context, const char* name) {
     jclass ctxClass = env->GetObjectClass(context);
     jmethodID getAssets = env->GetMethodID(ctxClass, "getAssets", "()Landroid/content/res/AssetManager;");
@@ -689,6 +878,15 @@ void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHe
     if (!matched) tamper("signature-mismatch");
 }
 
+void verifySignatureNative(const std::string& expectedHex) {
+    if (expectedHex.empty()) return;
+    std::string apkPath = getApkPathFromMaps();
+    if (apkPath.empty()) tamper("native-sig-apkpath");
+    std::string actual = certHashFromApkNative(apkPath);
+    if (actual.empty()) tamper("native-sig-read");
+    if (actual != expectedHex) tamper("native-sig-mismatch");
+}
+
 void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedHex) {
     if (expectedHex.empty()) return;
     if (bytesToHex(sha256Digest(payload)) != expectedHex) tamper("payload-integrity");
@@ -919,8 +1117,12 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (propFlag(props, "guard.antiReverseTools") && reverseToolPresent()) tamper("reverse-tool");
     if (propFlag(props, "guard.rootDetection") && isRooted()) tamper("root");
     if (propFlag(props, "guard.emulatorDetection") && isEmulator()) tamper("emulator");
-    if (propFlag(props, "guard.signatureVerification"))
-        verifySignature(env, context, propStr(props, "guard.certSha256"));
+
+    if (propFlag(props, "guard.signatureVerification")) {
+        std::string expectedCert = propStr(props, "guard.certSha256");
+        verifySignatureNative(expectedCert);
+        verifySignature(env, context, expectedCert);
+    }
 
     std::string payloadAsset = propStr(props, "rscoders.payload", "rscoders.payload");
     std::vector<uint8_t> payload = readAssetNative(env, context, payloadAsset.c_str());
