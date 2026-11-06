@@ -21,4 +21,12 @@ object CertFingerprint {
     fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes)
             .joinToString("") { "%02x".format(it) }
+
+    fun deriveKekWithCert(staticKek: ByteArray, certSha256Hex: String): ByteArray {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(staticKek)
+        md.update(certSha256Hex.toByteArray(Charsets.US_ASCII))
+        md.update("rscoders-kek-binding-v1".toByteArray(Charsets.US_ASCII))
+        return md.digest()
+    }
 }
