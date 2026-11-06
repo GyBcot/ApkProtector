@@ -123,7 +123,7 @@ bool reverseToolPresent() {
     return false;
 }
 
-} 
+}
 
 extern "C" {
 
@@ -161,7 +161,7 @@ void* antiPtracePoller(void*) {
     }
     return nullptr;
 }
-} 
+}
 
 JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeInstallAntiPtrace(JNIEnv*, jclass) {
@@ -250,7 +250,7 @@ int logPrintNoop(int, const char*, const char*, ...) { return 0; }
 int logWriteNoop(int, const char*, const char*) { return 0; }
 int logBufWriteNoop(int, int, const char*, const char*) { return 0; }
 
-} 
+}
 
 JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeSuppressLogs(JNIEnv*, jclass) {
@@ -334,7 +334,7 @@ jlong myOpenAsset(JNIEnv* env, jclass, jlong ptr, jstring name, jint mode) {
     }
     return 0;
 }
-} 
+}
 
 JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeRegisterProtectedAsset(JNIEnv* env, jclass, jstring name, jbyteArray data) {
@@ -454,7 +454,7 @@ Java_com_rscoders_stub_StubApp_nativeUnwrapDek(JNIEnv* env, jclass, jbyteArray w
 JNIEXPORT jbyteArray JNICALL
 Java_com_rscoders_stub_StubApp_nativeGetPropsKey(JNIEnv* env, jclass) {
     uint8_t kek[KEK_LEN]; loadKek(kek);
-    const char* label = "rscoders-props";
+    const char* label = "rscoders-props16";
     uint8_t buf[KEK_LEN + 16];
     memcpy(buf, kek, KEK_LEN);
     memcpy(buf + KEK_LEN, label, 16);
@@ -465,4 +465,4 @@ Java_com_rscoders_stub_StubApp_nativeGetPropsKey(JNIEnv* env, jclass) {
     return res;
 }
 
-} 
+}
