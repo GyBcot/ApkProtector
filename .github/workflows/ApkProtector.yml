@@ -77,34 +77,43 @@ jobs:
 
       - name: Install OpenSSL for Android
         run: |
+          NDK_VER="27.1.12297006"
+          NDK="$ANDROID_HOME/ndk/$NDK_VER"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          echo "NDK27=$NDK" >> $GITHUB_ENV
+          echo "SYSROOT27=$SYSROOT" >> $GITHUB_ENV
           wget -q https://github.com/KDAB/android_openssl/archive/refs/heads/master.zip -O openssl.zip
           unzip -q openssl.zip
-          echo "OPENSSL_DIR=$PWD/android_openssl-master/ssl_3" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE=$PWD/android_openssl-master/ssl_3/include" >> $GITHUB_ENV
 
       - name: Build ApkProtector Native Shell
         run: |
           cd ApkProtector
 
-          NDK_VER="$(ls $ANDROID_HOME/ndk | sort -V | tail -1)"
-          NDK="$ANDROID_HOME/ndk/$NDK_VER"
+          NDK="$NDK27"
           TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
-          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          SYSROOT="$SYSROOT27"
 
           SDK_CMAKE="$(ls -d $ANDROID_HOME/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
           CMAKE="${SDK_CMAKE:+$SDK_CMAKE/}cmake"
 
           for ABI in arm64-v8a armeabi-v7a; do
             if [ "$ABI" = "arm64-v8a" ]; then
-              OPENSSL_LIB="$OPENSSL_DIR/arm64-v8a"
               TRIPLE="aarch64-linux-android"
             else
-              OPENSSL_LIB="$OPENSSL_DIR/armeabi-v7a"
               TRIPLE="arm-linux-androideabi"
             fi
 
-            cp "$OPENSSL_LIB/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
-            cp "$OPENSSL_LIB/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
-            cp -rn "$OPENSSL_DIR/include/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
+            SSL_LIB="$SYSROOT/usr/lib/$TRIPLE/libssl.a"
+            CRYPTO_LIB="$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
+
+            if [ ! -f "$SSL_LIB" ]; then
+              KDAB_LIB="$PWD/../android_openssl-master/ssl_3/$ABI"
+              cp "$KDAB_LIB/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
+              cp "$KDAB_LIB/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
+            fi
+
+            cp -rn "$OPENSSL_INCLUDE/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
 
             OUT="shell-native/build/$ABI"
             mkdir -p "$OUT"
@@ -114,6 +123,7 @@ jobs:
               -DANDROID_ABI="$ABI" \
               -DANDROID_PLATFORM="android-21" \
               -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-undefined" \
               -GNinja
 
             $CMAKE --build "$OUT/.cmake"
