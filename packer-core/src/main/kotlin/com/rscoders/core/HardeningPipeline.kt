@@ -233,7 +233,7 @@ class HardeningPipeline(
 
     private fun derivePropsKey(kek: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256")
-            .digest(kek + "rscoders-props".toByteArray(Charsets.US_ASCII))
+            .digest(kek + "rscoders-props16".toByteArray(Charsets.US_ASCII))
 
     private fun readNativeLibs(apk: File): Map<String, ByteArray> {
         val re = Regex("lib/[^/]+/.+\\.so")
