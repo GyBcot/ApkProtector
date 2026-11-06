@@ -54,195 +54,6 @@ void loadKek(uint8_t out[32]) {
     for (int i = 0; i < 32; ++i) out[i] = g_kekBlob[16 + i];
 }
 
-static uint32_t readU32LE(const uint8_t* p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static uint16_t readU16LE(const uint8_t* p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static std::string getApkPathFromMaps() {
-    std::ifstream maps("/proc/self/maps");
-    std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find(".apk") != std::string::npos) {
-            auto pos = line.rfind(' ');
-            if (pos != std::string::npos) {
-                std::string path = line.substr(pos + 1);
-                if (!path.empty() && path.back() == '\n') path.pop_back();
-                if (!path.empty()) return path;
-            }
-        }
-    }
-    return "";
-}
-
-static std::vector<uint8_t> inflateRaw(const std::vector<uint8_t>& data) {
-    z_stream zs{};
-    inflateInit2(&zs, -15);
-    zs.next_in = const_cast<Bytef*>(data.data());
-    zs.avail_in = static_cast<uInt>(data.size());
-    std::vector<uint8_t> out;
-    uint8_t buf[65536];
-    int ret;
-    do {
-        zs.next_out = buf;
-        zs.avail_out = sizeof(buf);
-        ret = inflate(&zs, Z_NO_FLUSH);
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) break;
-        out.insert(out.end(), buf, buf + sizeof(buf) - zs.avail_out);
-    } while (ret != Z_STREAM_END);
-    inflateEnd(&zs);
-    return out;
-}
-
-static std::vector<uint8_t> readCertRsaFromApk(const std::string& apkPath) {
-    int fd = open(apkPath.c_str(), O_RDONLY);
-    if (fd < 0) return {};
-
-    off_t fileSize = lseek(fd, 0, SEEK_END);
-    if (fileSize < 22) { close(fd); return {}; }
-
-    uint8_t eocd[22];
-    off_t searchStart = fileSize - 22;
-    bool found = false;
-    while (searchStart >= 0) {
-        lseek(fd, searchStart, SEEK_SET);
-        if (read(fd, eocd, 22) != 22) break;
-        if (eocd[0] == 0x50 && eocd[1] == 0x4B && eocd[2] == 0x05 && eocd[3] == 0x06) {
-            found = true;
-            break;
-        }
-        searchStart--;
-    }
-    if (!found) { close(fd); return {}; }
-
-    uint32_t cdSize   = readU32LE(eocd + 12);
-    uint32_t cdOffset = readU32LE(eocd + 16);
-
-    std::vector<uint8_t> cd(cdSize);
-    lseek(fd, cdOffset, SEEK_SET);
-    if ((size_t)read(fd, cd.data(), cdSize) != cdSize) { close(fd); return {}; }
-
-    size_t pos = 0;
-    while (pos + 46 <= cdSize) {
-        if (readU32LE(cd.data() + pos) != 0x02014B50) break;
-        uint16_t method     = readU16LE(cd.data() + pos + 10);
-        uint32_t compSize   = readU32LE(cd.data() + pos + 20);
-        uint16_t fnLen      = readU16LE(cd.data() + pos + 28);
-        uint16_t extraLen   = readU16LE(cd.data() + pos + 30);
-        uint16_t commentLen = readU16LE(cd.data() + pos + 32);
-        uint32_t localOff   = readU32LE(cd.data() + pos + 42);
-
-        std::string name(cd.begin() + pos + 46, cd.begin() + pos + 46 + fnLen);
-
-        bool isCert = false;
-        if (name.size() >= 9 && name.substr(0, 9) == "META-INF/") {
-            std::string upper = name;
-            for (auto& c : upper) if (c >= 'a' && c <= 'z') c -= 32;
-            if (upper.size() >= 4) {
-                std::string ext4 = upper.substr(upper.size() - 4);
-                std::string ext3 = upper.size() >= 3 ? upper.substr(upper.size() - 3) : "";
-                if (ext4 == ".RSA" || ext4 == ".DSA" || ext3 == ".EC") isCert = true;
-            }
-        }
-
-        if (isCert) {
-            uint8_t lhBuf[30];
-            lseek(fd, localOff, SEEK_SET);
-            if (read(fd, lhBuf, 30) == 30 && readU32LE(lhBuf) == 0x04034B50) {
-                uint16_t lhExtraLen = readU16LE(lhBuf + 28);
-                uint16_t lhFnLen    = readU16LE(lhBuf + 26);
-                off_t dataOff = localOff + 30 + lhFnLen + lhExtraLen;
-                lseek(fd, dataOff, SEEK_SET);
-                std::vector<uint8_t> compData(compSize);
-                if ((size_t)read(fd, compData.data(), compSize) == compSize) {
-                    close(fd);
-                    if (method == 0) return compData;
-                    return inflateRaw(compData);
-                }
-            }
-            break;
-        }
-
-        pos += 46 + fnLen + extraLen + commentLen;
-    }
-
-    close(fd);
-    return {};
-}
-
-static void sha256Native(const uint8_t* data, size_t len, uint8_t out[32]) {
-    uint32_t h[8] = {
-        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
-    };
-    static const uint32_t K[64] = {
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    };
-    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
-
-    uint64_t bitLen = (uint64_t)len * 8;
-    std::vector<uint8_t> msg(data, data + len);
-    msg.push_back(0x80);
-    while (msg.size() % 64 != 56) msg.push_back(0);
-    for (int i = 7; i >= 0; i--) msg.push_back((uint8_t)(bitLen >> (8 * i)));
-
-    for (size_t i = 0; i < msg.size(); i += 64) {
-        uint32_t w[64];
-        for (int j = 0; j < 16; j++) {
-            w[j] = ((uint32_t)msg[i+j*4] << 24) | ((uint32_t)msg[i+j*4+1] << 16) |
-                   ((uint32_t)msg[i+j*4+2] << 8) | msg[i+j*4+3];
-        }
-        for (int j = 16; j < 64; j++) {
-            uint32_t s0 = rotr(w[j-15],7) ^ rotr(w[j-15],18) ^ (w[j-15] >> 3);
-            uint32_t s1 = rotr(w[j-2],17) ^ rotr(w[j-2],19) ^ (w[j-2] >> 10);
-            w[j] = w[j-16] + s0 + w[j-7] + s1;
-        }
-        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
-        for (int j = 0; j < 64; j++) {
-            uint32_t S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
-            uint32_t ch = (e & f) ^ (~e & g);
-            uint32_t temp1 = hh + S1 + ch + K[j] + w[j];
-            uint32_t S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
-            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-            uint32_t temp2 = S0 + maj;
-            hh=g; g=f; f=e; e=d+temp1; d=c; c=b; b=a; a=temp1+temp2;
-        }
-        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
-        h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
-    }
-    for (int i = 0; i < 8; i++) {
-        out[i*4+0] = (h[i] >> 24) & 0xFF;
-        out[i*4+1] = (h[i] >> 16) & 0xFF;
-        out[i*4+2] = (h[i] >>  8) & 0xFF;
-        out[i*4+3] =  h[i]        & 0xFF;
-    }
-}
-
-static std::string certHashFromApkNative(const std::string& apkPath) {
-    std::vector<uint8_t> certDer = readCertRsaFromApk(apkPath);
-    if (certDer.empty()) return "";
-    uint8_t digest[32];
-    sha256Native(certDer.data(), certDer.size(), digest);
-    static const char hex[] = "0123456789abcdef";
-    std::string s;
-    s.reserve(64);
-    for (int i = 0; i < 32; i++) {
-        s += hex[digest[i] >> 4];
-        s += hex[digest[i] & 0xF];
-    }
-    return s;
-}
-
 std::vector<uint8_t> readAssetNative(JNIEnv* env, jobject context, const char* name) {
     jclass ctxClass = env->GetObjectClass(context);
     jmethodID getAssets = env->GetMethodID(ctxClass, "getAssets", "()Landroid/content/res/AssetManager;");
@@ -512,6 +323,443 @@ void installAntiPtrace() {
     if (pthread_create(&t, nullptr, antiPtracePoller, nullptr) == 0) {
         pthread_detach(t);
     }
+}
+
+static uint32_t readU32LE(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint16_t readU16LE(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+struct ZipEntry {
+    uint32_t offset;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t method;
+};
+
+static bool findZipEntry(const std::vector<uint8_t>& apk, const std::string& name, ZipEntry& out) {
+    if (apk.size() < 22) return false;
+    const uint8_t* data = apk.data();
+    size_t sz = apk.size();
+
+    int64_t eocdOff = -1;
+    for (int64_t i = (int64_t)sz - 22; i >= 0; i--) {
+        if (data[i] == 0x50 && data[i+1] == 0x4B && data[i+2] == 0x05 && data[i+3] == 0x06) {
+            eocdOff = i;
+            break;
+        }
+    }
+    if (eocdOff < 0) return false;
+
+    uint32_t cdSize   = readU32LE(data + eocdOff + 12);
+    uint32_t cdOffset = readU32LE(data + eocdOff + 16);
+    if (cdOffset + cdSize > sz) return false;
+
+    const uint8_t* cd = data + cdOffset;
+    uint32_t pos = 0;
+    while (pos + 46 <= cdSize) {
+        if (cd[pos] != 0x50 || cd[pos+1] != 0x4B || cd[pos+2] != 0x01 || cd[pos+3] != 0x02) break;
+        uint16_t method    = readU16LE(cd + pos + 10);
+        uint32_t compSz    = readU32LE(cd + pos + 20);
+        uint32_t uncompSz  = readU32LE(cd + pos + 24);
+        uint16_t nameLen   = readU16LE(cd + pos + 28);
+        uint16_t extraLen  = readU16LE(cd + pos + 30);
+        uint16_t commentLen= readU16LE(cd + pos + 32);
+        uint32_t localOff  = readU32LE(cd + pos + 42);
+        std::string entryName((const char*)(cd + pos + 46), nameLen);
+        if (entryName == name) {
+            out.offset         = localOff;
+            out.compressedSize = compSz;
+            out.uncompressedSize = uncompSz;
+            out.method         = method;
+            return true;
+        }
+        pos += 46 + nameLen + extraLen + commentLen;
+    }
+    return false;
+}
+
+static std::vector<uint8_t> extractZipEntry(const std::vector<uint8_t>& apk, const ZipEntry& e) {
+    const uint8_t* data = apk.data();
+    size_t sz = apk.size();
+    uint32_t lh = e.offset;
+    if (lh + 30 > sz) return {};
+    uint16_t nameLen  = readU16LE(data + lh + 26);
+    uint16_t extraLen = readU16LE(data + lh + 28);
+    uint32_t dataOff  = lh + 30 + nameLen + extraLen;
+    if (dataOff + e.compressedSize > sz) return {};
+    std::vector<uint8_t> raw(data + dataOff, data + dataOff + e.compressedSize);
+    if (e.method == 0) return raw;
+    z_stream zs{};
+    inflateInit2(&zs, -15);
+    zs.next_in  = raw.data();
+    zs.avail_in = static_cast<uInt>(raw.size());
+    std::vector<uint8_t> out;
+    out.reserve(e.uncompressedSize);
+    uint8_t buf[65536];
+    int ret;
+    do {
+        zs.next_out  = buf;
+        zs.avail_out = sizeof(buf);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        out.insert(out.end(), buf, buf + sizeof(buf) - zs.avail_out);
+    } while (ret == Z_OK);
+    inflateEnd(&zs);
+    return out;
+}
+
+static std::vector<uint8_t> parsePkcs7Cert(const std::vector<uint8_t>& der) {
+    if (der.size() < 4) return {};
+    const uint8_t* p = der.data();
+    size_t sz = der.size();
+
+    auto readLen = [](const uint8_t* p, size_t& consumed) -> size_t {
+        if (p[0] < 0x80) { consumed = 1; return p[0]; }
+        size_t nb = p[0] & 0x7F;
+        size_t len = 0;
+        for (size_t i = 0; i < nb; i++) len = (len << 8) | p[1 + i];
+        consumed = 1 + nb;
+        return len;
+    };
+
+    auto skip = [&](size_t& off, uint8_t tag) -> bool {
+        if (off >= sz || p[off] != tag) return false;
+        off++;
+        size_t c; size_t l = readLen(p + off, c); off += c + l;
+        return true;
+    };
+
+    auto enter = [&](size_t& off, uint8_t tag, size_t& contentOff, size_t& contentLen) -> bool {
+        if (off >= sz || (p[off] & 0x1F) != (tag & 0x1F) && p[off] != tag) return false;
+        off++;
+        size_t c;
+        contentLen = readLen(p + off, c);
+        off += c;
+        contentOff = off;
+        return true;
+    };
+    (void)skip;
+
+    size_t off = 0, co, cl;
+    if (!enter(off, 0x30, co, cl)) return {};
+    if (!enter(off, 0x06, co, cl)) return {};
+    off = co + cl;
+    if (off < sz && (p[off] == 0xA0)) {
+        off++;
+        size_t c; size_t l = readLen(p + off, c); off += c;
+        off += l;
+    }
+    if (!enter(off, 0x30, co, cl)) return {};
+    size_t seqEnd = co + cl;
+
+    if (!enter(off, 0x02, co, cl)) return {};
+    off = co + cl;
+
+    while (off < seqEnd) {
+        if (off + 2 >= sz) break;
+        uint8_t tag = p[off];
+        off++;
+        size_t c; size_t l = readLen(p + off, c); off += c;
+        if (tag == 0x30) {
+            size_t inner = off;
+            size_t innerEnd = off + l;
+            if (inner < innerEnd && p[inner] == 0x30) {
+                size_t ioff = inner;
+                if (enter(ioff, 0x30, co, cl)) {
+                    return std::vector<uint8_t>(p + inner, p + innerEnd);
+                }
+            }
+        }
+        off += l;
+    }
+    return {};
+}
+
+static std::string getApkPath(JNIEnv* env, jobject context) {
+    jclass ctxClass = env->GetObjectClass(context);
+    jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo",
+        "()Landroid/content/pm/ApplicationInfo;");
+    jobject appInfo = env->CallObjectMethod(context, getAppInfo);
+    jclass aiClass = env->GetObjectClass(appInfo);
+    jfieldID sourceDir = env->GetFieldID(aiClass, "sourceDir", "Ljava/lang/String;");
+    jstring jpath = static_cast<jstring>(env->GetObjectField(appInfo, sourceDir));
+    const char* c = env->GetStringUTFChars(jpath, nullptr);
+    std::string path(c ? c : "");
+    env->ReleaseStringUTFChars(jpath, c);
+    env->DeleteLocalRef(jpath);
+    env->DeleteLocalRef(aiClass);
+    env->DeleteLocalRef(appInfo);
+    env->DeleteLocalRef(ctxClass);
+    return path;
+}
+
+void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHex) {
+    if (expectedHex.empty()) return;
+
+    std::string apkPath = getApkPath(env, context);
+    if (apkPath.empty()) { tamper("sig-path"); return; }
+
+    FILE* f = fopen(apkPath.c_str(), "rb");
+    if (!f) { tamper("sig-open"); return; }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) { fclose(f); tamper("sig-size"); return; }
+    std::vector<uint8_t> apk(static_cast<size_t>(fsz));
+    fread(apk.data(), 1, apk.size(), f);
+    fclose(f);
+
+    bool matched = false;
+    const std::string metaPrefix = "META-INF/";
+    const uint8_t* cd = nullptr;
+    uint32_t cdSize = 0, cdOffset = 0;
+    size_t sz = apk.size();
+    const uint8_t* data = apk.data();
+
+    for (int64_t i = (int64_t)sz - 22; i >= 0; i--) {
+        if (data[i]==0x50&&data[i+1]==0x4B&&data[i+2]==0x05&&data[i+3]==0x06) {
+            cdSize   = readU32LE(data + i + 12);
+            cdOffset = readU32LE(data + i + 16);
+            break;
+        }
+    }
+    if (cdOffset + cdSize > sz) { tamper("sig-cd"); return; }
+    cd = data + cdOffset;
+
+    uint32_t pos = 0;
+    while (pos + 46 <= cdSize && !matched) {
+        if (cd[pos]!=0x50||cd[pos+1]!=0x4B||cd[pos+2]!=0x01||cd[pos+3]!=0x02) break;
+        uint16_t nameLen    = readU16LE(cd + pos + 28);
+        uint16_t extraLen   = readU16LE(cd + pos + 30);
+        uint16_t commentLen = readU16LE(cd + pos + 32);
+        std::string ename((const char*)(cd + pos + 46), nameLen);
+
+        bool isSigFile = false;
+        if (ename.size() > metaPrefix.size() &&
+            ename.substr(0, metaPrefix.size()) == metaPrefix) {
+            std::string ext = ename.size() >= 4
+                ? ename.substr(ename.size() - 4) : "";
+            for (auto& ch : ext) ch = (char)toupper((unsigned char)ch);
+            if (ext == ".RSA" || ext == ".DSA" || ext == ".EC") isSigFile = true;
+        }
+
+        if (isSigFile) {
+            ZipEntry ze;
+            if (findZipEntry(apk, ename, ze)) {
+                std::vector<uint8_t> sigDer = extractZipEntry(apk, ze);
+                if (!sigDer.empty()) {
+                    std::vector<uint8_t> certDer = parsePkcs7Cert(sigDer);
+                    if (!certDer.empty()) {
+                        if (bytesToHex(sha256Digest(certDer)) == expectedHex) {
+                            matched = true;
+                        }
+                    }
+                }
+            }
+        }
+        pos += 46 + nameLen + extraLen + commentLen;
+    }
+
+    if (!matched) tamper("signature-mismatch");
+}
+
+void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedHex) {
+    if (expectedHex.empty()) return;
+    if (bytesToHex(sha256Digest(payload)) != expectedHex) tamper("payload-integrity");
+}
+
+#if defined(__LP64__)
+#define CA_R_SYM(i) ELF64_R_SYM(i)
+#else
+#define CA_R_SYM(i) ELF32_R_SYM(i)
+#endif
+
+struct HookReq { const char* name; void* repl; };
+
+void patchSlot(void** slot, void* val) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t page = reinterpret_cast<uintptr_t>(slot) & ~(static_cast<uintptr_t>(ps) - 1);
+    if (mprotect(reinterpret_cast<void*>(page), ps, PROT_READ | PROT_WRITE) == 0) *slot = val;
+}
+
+void hookModule(struct dl_phdr_info* info, const HookReq* reqs, int nreqs) {
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return;
+    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
+        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
+    };
+    const char* strtab = nullptr;
+    const ElfW(Sym)* symtab = nullptr;
+    ElfW(Addr) jmprel = 0; size_t pltrelsz = 0; long pltrel = 0;
+    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+        switch (d->d_tag) {
+            case DT_STRTAB:
+                strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr)); break;
+            case DT_SYMTAB:
+                symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr)); break;
+            case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
+            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+            case DT_PLTREL: pltrel = d->d_un.d_val; break;
+        }
+    }
+    if (!strtab || !symtab || !jmprel || !pltrelsz) return;
+    uintptr_t rel = resolve(jmprel);
+    auto tryHook = [&](uint32_t symIdx, ElfW(Addr) rOffset) {
+        const char* name = strtab + symtab[symIdx].st_name;
+        for (int k = 0; k < nreqs; ++k)
+            if (strcmp(name, reqs[k].name) == 0)
+                patchSlot(reinterpret_cast<void**>(
+                    info->dlpi_addr + rOffset), reqs[k].repl);
+    };
+    if (pltrel == DT_RELA) {
+        auto* r = reinterpret_cast<ElfW(Rela)*>(rel);
+        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); ++i)
+            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
+    } else {
+        auto* r = reinterpret_cast<ElfW(Rel)*>(rel);
+        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rel)); ++i)
+            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
+    }
+}
+
+struct HookCtx { const HookReq* reqs; int n; };
+int phdrCb(struct dl_phdr_info* info, size_t, void* data) {
+    const char* nm = info->dlpi_name ? info->dlpi_name : "";
+    if (strstr(nm, "librscoders.so") || strstr(nm, "linker")) return 0;
+    auto* ctx = reinterpret_cast<HookCtx*>(data);
+    hookModule(info, ctx->reqs, ctx->n);
+    return 0;
+}
+
+void pltHookAll(const HookReq* reqs, int n) {
+    HookCtx ctx{reqs, n};
+    dl_iterate_phdr(phdrCb, &ctx);
+}
+
+int logPrintNoop(int, const char*, const char*, ...) { return 0; }
+int logWriteNoop(int, const char*, const char*) { return 0; }
+int logBufWriteNoop(int, int, const char*, const char*) { return 0; }
+
+std::map<std::string, std::vector<uint8_t>>* g_protected = nullptr;
+
+using CreateFromFdFn = void* (*)(int, const char*, int);
+struct UP { void* p; };
+using OpenFn = UP (*)(const void*, const std::string*, int);
+CreateFromFdFn g_createFromFd = nullptr;
+OpenFn g_open = nullptr;
+
+struct FindSym { const char* mod; const char* sym; void* result; };
+int findSymCb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* f = reinterpret_cast<FindSym*>(data);
+    const char* nm = info->dlpi_name ? info->dlpi_name : "";
+    if (!strstr(nm, f->mod)) return 0;
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; ++i)
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    if (!dyn) return 0;
+    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
+        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
+    };
+    const char* strtab = nullptr;
+    const ElfW(Sym)* symtab = nullptr;
+    size_t syment = sizeof(ElfW(Sym));
+    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
+        if (d->d_tag == DT_STRTAB)
+            strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr));
+        else if (d->d_tag == DT_SYMTAB)
+            symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr));
+        else if (d->d_tag == DT_SYMENT)
+            syment = d->d_un.d_val;
+    }
+    if (!strtab || !symtab) return 0;
+    size_t count = (reinterpret_cast<uintptr_t>(strtab) -
+        reinterpret_cast<uintptr_t>(symtab)) / syment;
+    for (size_t i = 0; i < count; ++i) {
+        const ElfW(Sym)* s = reinterpret_cast<const ElfW(Sym)*>(
+            reinterpret_cast<const char*>(symtab) + i * syment);
+        if (s->st_name == 0 || s->st_shndx == SHN_UNDEF) continue;
+        if (strcmp(strtab + s->st_name, f->sym) == 0) {
+            f->result = reinterpret_cast<void*>(info->dlpi_addr + s->st_value);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void* symFrom(const char* mod, const char* sym) {
+    FindSym f{mod, sym, nullptr};
+    dl_iterate_phdr(findSymCb, &f);
+    return f.result;
+}
+
+std::map<std::string, std::vector<uint8_t>>* g_protectedSo = nullptr;
+using DlopenExtFn = void* (*)(const char*, int, const android_dlextinfo*);
+DlopenExtFn g_realDlopenExt = nullptr;
+
+const char* baseName(const char* path) {
+    const char* s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+
+void* myDlopenExt(const char* filename, int flags, const android_dlextinfo* extinfo) {
+    if (filename && g_protectedSo && g_realDlopenExt) {
+        auto it = g_protectedSo->find(baseName(filename));
+        if (it != g_protectedSo->end()) {
+            const std::vector<uint8_t>& data = it->second;
+            int fd = static_cast<int>(syscall(SYS_memfd_create, "ca-so", 0));
+            if (fd >= 0) {
+                (void)!write(fd, data.data(), data.size());
+                android_dlextinfo info{};
+                if (extinfo) info = *extinfo;
+                info.flags |= ANDROID_DLEXT_USE_LIBRARY_FD;
+                info.library_fd = fd;
+                void* h = g_realDlopenExt(filename, flags, &info);
+                if (h) return h;
+            }
+        }
+    }
+    return g_realDlopenExt ? g_realDlopenExt(filename, flags, extinfo) : nullptr;
+}
+
+struct ModHook { const char* mod; const HookReq* reqs; int n; };
+int modHookCb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* m = reinterpret_cast<ModHook*>(data);
+    const char* nm = info->dlpi_name ? info->dlpi_name : "";
+    if (strstr(nm, m->mod)) hookModule(info, m->reqs, m->n);
+    return 0;
+}
+
+void installSoHook() {
+    g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
+        dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    if (!g_realDlopenExt)
+        g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
+            symFrom("libdl", "android_dlopen_ext"));
+    if (!g_realDlopenExt) return;
+    HookReq req{"android_dlopen_ext", reinterpret_cast<void*>(&myDlopenExt)};
+    ModHook mh{"libnativeloader", &req, 1};
+    dl_iterate_phdr(modHookCb, &mh);
+}
+
+void installAssetHook() {
+    g_createFromFd = reinterpret_cast<CreateFromFdFn>(symFrom("libandroidfw.so",
+        "_ZN7android5Asset12createFromFdEiPKcNS0_10AccessModeE"));
+    g_open = reinterpret_cast<OpenFn>(symFrom("libandroidfw.so",
+        "_ZNK7android13AssetManager24OpenERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS_5Asset10AccessModeE"));
 }
 
 void injectDex(JNIEnv* env, jobject context, const std::vector<std::vector<uint8_t>>& dexBlobs) {
@@ -805,284 +1053,6 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
     env->DeleteLocalRef(allAppsCls);
 }
 
-void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHex) {
-    if (expectedHex.empty()) return;
-    jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getPm = env->GetMethodID(ctxClass, "getPackageManager",
-        "()Landroid/content/pm/PackageManager;");
-    jmethodID getPkg = env->GetMethodID(ctxClass, "getPackageName", "()Ljava/lang/String;");
-    jobject pm = env->CallObjectMethod(context, getPm);
-    jstring pkg = static_cast<jstring>(env->CallObjectMethod(context, getPkg));
-    jclass pmClass = env->GetObjectClass(pm);
-    jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
-        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
-    jobject pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)0x8000000);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)64);
-    }
-    jclass piClass = env->GetObjectClass(pi);
-    bool matched = false;
-    jfieldID sigInfoField = env->GetFieldID(piClass, "signingInfo",
-        "Landroid/content/pm/SigningInfo;");
-    if (sigInfoField && !env->ExceptionCheck()) {
-        jobject sigInfo = env->GetObjectField(pi, sigInfoField);
-        jclass siClass = env->GetObjectClass(sigInfo);
-        jmethodID getSigners = env->GetMethodID(siClass, "getApkContentsSigners",
-            "()[Landroid/content/pm/Signature;");
-        jobjectArray sigs = static_cast<jobjectArray>(env->CallObjectMethod(sigInfo, getSigners));
-        jclass sigClass = env->FindClass("android/content/pm/Signature");
-        jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
-        jint sigCount = env->GetArrayLength(sigs);
-        for (jint i = 0; i < sigCount && !matched; i++) {
-            jobject sig = env->GetObjectArrayElement(sigs, i);
-            jbyteArray sigBytes = static_cast<jbyteArray>(env->CallObjectMethod(sig, toBytes));
-            jsize len = env->GetArrayLength(sigBytes);
-            std::vector<uint8_t> bytes(len);
-            env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
-            if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
-        }
-        env->DeleteLocalRef(sigInfo);
-        env->DeleteLocalRef(siClass);
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
-    } else {
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        jfieldID sigsField = env->GetFieldID(piClass, "signatures",
-            "[Landroid/content/pm/Signature;");
-        jobjectArray sigs = static_cast<jobjectArray>(env->GetObjectField(pi, sigsField));
-        jclass sigClass = env->FindClass("android/content/pm/Signature");
-        jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
-        jint sigCount = env->GetArrayLength(sigs);
-        for (jint i = 0; i < sigCount && !matched; i++) {
-            jobject sig = env->GetObjectArrayElement(sigs, i);
-            jbyteArray sigBytes = static_cast<jbyteArray>(env->CallObjectMethod(sig, toBytes));
-            jsize len = env->GetArrayLength(sigBytes);
-            std::vector<uint8_t> bytes(len);
-            env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
-            if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
-        }
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
-    }
-    env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(pm);
-    env->DeleteLocalRef(pkg);
-    env->DeleteLocalRef(pmClass);
-    env->DeleteLocalRef(pi);
-    env->DeleteLocalRef(piClass);
-    if (!matched) tamper("signature-mismatch");
-}
-
-void verifySignatureNative(const std::string& expectedHex) {
-    if (expectedHex.empty()) return;
-    std::string apkPath = getApkPathFromMaps();
-    if (apkPath.empty()) tamper("native-sig-apkpath");
-    std::string actual = certHashFromApkNative(apkPath);
-    if (actual.empty()) tamper("native-sig-read");
-    if (actual != expectedHex) tamper("native-sig-mismatch");
-}
-
-void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedHex) {
-    if (expectedHex.empty()) return;
-    if (bytesToHex(sha256Digest(payload)) != expectedHex) tamper("payload-integrity");
-}
-
-#if defined(__LP64__)
-#define CA_R_SYM(i) ELF64_R_SYM(i)
-#else
-#define CA_R_SYM(i) ELF32_R_SYM(i)
-#endif
-
-struct HookReq { const char* name; void* repl; };
-
-void patchSlot(void** slot, void* val) {
-    long ps = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(slot) & ~(static_cast<uintptr_t>(ps) - 1);
-    if (mprotect(reinterpret_cast<void*>(page), ps, PROT_READ | PROT_WRITE) == 0) *slot = val;
-}
-
-void hookModule(struct dl_phdr_info* info, const HookReq* reqs, int nreqs) {
-    const ElfW(Dyn)* dyn = nullptr;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-            break;
-        }
-    }
-    if (!dyn) return;
-    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
-        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
-    };
-    const char* strtab = nullptr;
-    const ElfW(Sym)* symtab = nullptr;
-    ElfW(Addr) jmprel = 0; size_t pltrelsz = 0; long pltrel = 0;
-    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
-        switch (d->d_tag) {
-            case DT_STRTAB:
-                strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr)); break;
-            case DT_SYMTAB:
-                symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr)); break;
-            case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-            case DT_PLTREL: pltrel = d->d_un.d_val; break;
-        }
-    }
-    if (!strtab || !symtab || !jmprel || !pltrelsz) return;
-    uintptr_t rel = resolve(jmprel);
-    auto tryHook = [&](uint32_t symIdx, ElfW(Addr) rOffset) {
-        const char* name = strtab + symtab[symIdx].st_name;
-        for (int k = 0; k < nreqs; ++k)
-            if (strcmp(name, reqs[k].name) == 0)
-                patchSlot(reinterpret_cast<void**>(
-                    info->dlpi_addr + rOffset), reqs[k].repl);
-    };
-    if (pltrel == DT_RELA) {
-        auto* r = reinterpret_cast<ElfW(Rela)*>(rel);
-        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); ++i)
-            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
-    } else {
-        auto* r = reinterpret_cast<ElfW(Rel)*>(rel);
-        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rel)); ++i)
-            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
-    }
-}
-
-struct HookCtx { const HookReq* reqs; int n; };
-int phdrCb(struct dl_phdr_info* info, size_t, void* data) {
-    const char* nm = info->dlpi_name ? info->dlpi_name : "";
-    if (strstr(nm, "librscoders.so") || strstr(nm, "linker")) return 0;
-    auto* ctx = reinterpret_cast<HookCtx*>(data);
-    hookModule(info, ctx->reqs, ctx->n);
-    return 0;
-}
-
-void pltHookAll(const HookReq* reqs, int n) {
-    HookCtx ctx{reqs, n};
-    dl_iterate_phdr(phdrCb, &ctx);
-}
-
-int logPrintNoop(int, const char*, const char*, ...) { return 0; }
-int logWriteNoop(int, const char*, const char*) { return 0; }
-int logBufWriteNoop(int, int, const char*, const char*) { return 0; }
-
-std::map<std::string, std::vector<uint8_t>>* g_protected = nullptr;
-
-using CreateFromFdFn = void* (*)(int, const char*, int);
-struct UP { void* p; };
-using OpenFn = UP (*)(const void*, const std::string*, int);
-CreateFromFdFn g_createFromFd = nullptr;
-OpenFn g_open = nullptr;
-
-struct FindSym { const char* mod; const char* sym; void* result; };
-int findSymCb(struct dl_phdr_info* info, size_t, void* data) {
-    auto* f = reinterpret_cast<FindSym*>(data);
-    const char* nm = info->dlpi_name ? info->dlpi_name : "";
-    if (!strstr(nm, f->mod)) return 0;
-    const ElfW(Dyn)* dyn = nullptr;
-    for (int i = 0; i < info->dlpi_phnum; ++i)
-        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-            break;
-        }
-    if (!dyn) return 0;
-    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
-        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
-    };
-    const char* strtab = nullptr;
-    const ElfW(Sym)* symtab = nullptr;
-    size_t syment = sizeof(ElfW(Sym));
-    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
-        if (d->d_tag == DT_STRTAB)
-            strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr));
-        else if (d->d_tag == DT_SYMTAB)
-            symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr));
-        else if (d->d_tag == DT_SYMENT)
-            syment = d->d_un.d_val;
-    }
-    if (!strtab || !symtab) return 0;
-    size_t count = (reinterpret_cast<uintptr_t>(strtab) -
-        reinterpret_cast<uintptr_t>(symtab)) / syment;
-    for (size_t i = 0; i < count; ++i) {
-        const ElfW(Sym)* s = reinterpret_cast<const ElfW(Sym)*>(
-            reinterpret_cast<const char*>(symtab) + i * syment);
-        if (s->st_name == 0 || s->st_shndx == SHN_UNDEF) continue;
-        if (strcmp(strtab + s->st_name, f->sym) == 0) {
-            f->result = reinterpret_cast<void*>(info->dlpi_addr + s->st_value);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void* symFrom(const char* mod, const char* sym) {
-    FindSym f{mod, sym, nullptr};
-    dl_iterate_phdr(findSymCb, &f);
-    return f.result;
-}
-
-std::map<std::string, std::vector<uint8_t>>* g_protectedSo = nullptr;
-using DlopenExtFn = void* (*)(const char*, int, const android_dlextinfo*);
-DlopenExtFn g_realDlopenExt = nullptr;
-
-const char* baseName(const char* path) {
-    const char* s = strrchr(path, '/');
-    return s ? s + 1 : path;
-}
-
-void* myDlopenExt(const char* filename, int flags, const android_dlextinfo* extinfo) {
-    if (filename && g_protectedSo && g_realDlopenExt) {
-        auto it = g_protectedSo->find(baseName(filename));
-        if (it != g_protectedSo->end()) {
-            const std::vector<uint8_t>& data = it->second;
-            int fd = static_cast<int>(syscall(SYS_memfd_create, "ca-so", 0));
-            if (fd >= 0) {
-                (void)!write(fd, data.data(), data.size());
-                android_dlextinfo info{};
-                if (extinfo) info = *extinfo;
-                info.flags |= ANDROID_DLEXT_USE_LIBRARY_FD;
-                info.library_fd = fd;
-                void* h = g_realDlopenExt(filename, flags, &info);
-                if (h) return h;
-            }
-        }
-    }
-    return g_realDlopenExt ? g_realDlopenExt(filename, flags, extinfo) : nullptr;
-}
-
-struct ModHook { const char* mod; const HookReq* reqs; int n; };
-int modHookCb(struct dl_phdr_info* info, size_t, void* data) {
-    auto* m = reinterpret_cast<ModHook*>(data);
-    const char* nm = info->dlpi_name ? info->dlpi_name : "";
-    if (strstr(nm, m->mod)) hookModule(info, m->reqs, m->n);
-    return 0;
-}
-
-void installSoHook() {
-    g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
-        dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
-    if (!g_realDlopenExt)
-        g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
-            symFrom("libdl", "android_dlopen_ext"));
-    if (!g_realDlopenExt) return;
-    HookReq req{"android_dlopen_ext", reinterpret_cast<void*>(&myDlopenExt)};
-    ModHook mh{"libnativeloader", &req, 1};
-    dl_iterate_phdr(modHookCb, &mh);
-}
-
-void installAssetHook() {
-    g_createFromFd = reinterpret_cast<CreateFromFdFn>(symFrom("libandroidfw.so",
-        "_ZN7android5Asset12createFromFdEiPKcNS0_10AccessModeE"));
-    g_open = reinterpret_cast<OpenFn>(symFrom("libandroidfw.so",
-        "_ZNK7android13AssetManager24OpenERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS_5Asset10AccessModeE"));
-}
-
 }
 
 extern "C" {
@@ -1117,12 +1087,8 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (propFlag(props, "guard.antiReverseTools") && reverseToolPresent()) tamper("reverse-tool");
     if (propFlag(props, "guard.rootDetection") && isRooted()) tamper("root");
     if (propFlag(props, "guard.emulatorDetection") && isEmulator()) tamper("emulator");
-
-    if (propFlag(props, "guard.signatureVerification")) {
-        std::string expectedCert = propStr(props, "guard.certSha256");
-        verifySignatureNative(expectedCert);
-        verifySignature(env, context, expectedCert);
-    }
+    if (propFlag(props, "guard.signatureVerification"))
+        verifySignature(env, context, propStr(props, "guard.certSha256"));
 
     std::string payloadAsset = propStr(props, "rscoders.payload", "rscoders.payload");
     std::vector<uint8_t> payload = readAssetNative(env, context, payloadAsset.c_str());
