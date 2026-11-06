@@ -70,60 +70,34 @@ jobs:
 
       - name: Setup Android NDK
         run: |
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
             "ndk;27.1.12297006" \
             "build-tools;36.1.0" \
             "cmake;3.22.1" || true
 
       - name: Install OpenSSL for Android
         run: |
-          NDK_VER="27.1.12297006"
-          NDK="$ANDROID_HOME/ndk/$NDK_VER"
+          NDK="$ANDROID_HOME/ndk/27.1.12297006"
           SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          echo "NDK27=$NDK" >> $GITHUB_ENV
-          echo "SYSROOT27=$SYSROOT" >> $GITHUB_ENV
-          OPENSSL_TAG="2024.09.04"
-          OPENSSL_VER="3.3.2"
-          wget -q "https://github.com/217heidai/openssl_for_android/releases/download/${OPENSSL_TAG}/openssl_static_android_${OPENSSL_VER}.zip" -O openssl.zip
+          wget -q "https://github.com/217heidai/openssl_for_android/releases/download/2024.09.04/openssl_static_android_3.3.2.zip" -O openssl.zip
           unzip -q openssl.zip
-          echo "OPENSSL_ROOT=$PWD/openssl_static_android_${OPENSSL_VER}" >> $GITHUB_ENV
-
-      - name: Build ApkProtector Native Shell
-        run: |
-          cd ApkProtector
-
-          NDK="$NDK27"
-          TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
-          SYSROOT="$SYSROOT27"
-
-          SDK_CMAKE="$(ls -d $ANDROID_HOME/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
-          CMAKE="${SDK_CMAKE:+$SDK_CMAKE/}cmake"
-
+          OPENSSL_ROOT="$PWD/openssl_static_android_3.3.2"
           for ABI in arm64-v8a armeabi-v7a; do
             if [ "$ABI" = "arm64-v8a" ]; then
               TRIPLE="aarch64-linux-android"
             else
               TRIPLE="arm-linux-androideabi"
             fi
-
             cp "$OPENSSL_ROOT/$ABI/lib/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
             cp "$OPENSSL_ROOT/$ABI/lib/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
             cp -rn "$OPENSSL_ROOT/$ABI/include/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
-
-            OUT="shell-native/build/$ABI"
-            mkdir -p "$OUT"
-
-            $CMAKE -S shell-native -B "$OUT/.cmake" \
-              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-              -DANDROID_ABI="$ABI" \
-              -DANDROID_PLATFORM="android-21" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -GNinja
-
-            $CMAKE --build "$OUT/.cmake"
-            cp "$OUT/.cmake/librscoders.so" "$OUT/librscoders.so"
-            echo "   -> $OUT/librscoders.so"
           done
+
+      - name: Build ApkProtector Native Shell
+        run: |
+          cd ApkProtector
+          chmod +x shell-native/build-native.sh
+          ./shell-native/build-native.sh
 
       - name: Build ApkProtector Stub DEX
         run: |
