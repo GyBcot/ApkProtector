@@ -82,9 +82,11 @@ jobs:
           SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           echo "NDK27=$NDK" >> $GITHUB_ENV
           echo "SYSROOT27=$SYSROOT" >> $GITHUB_ENV
-          wget -q https://github.com/KDAB/android_openssl/archive/refs/heads/master.zip -O openssl.zip
+          OPENSSL_TAG="2024.09.04"
+          OPENSSL_VER="3.3.2"
+          wget -q "https://github.com/217heidai/openssl_for_android/releases/download/${OPENSSL_TAG}/openssl_static_android_${OPENSSL_VER}.zip" -O openssl.zip
           unzip -q openssl.zip
-          echo "OPENSSL_INCLUDE=$PWD/android_openssl-master/ssl_3/include" >> $GITHUB_ENV
+          echo "OPENSSL_ROOT=$PWD/openssl_static_android_${OPENSSL_VER}" >> $GITHUB_ENV
 
       - name: Build ApkProtector Native Shell
         run: |
@@ -104,16 +106,9 @@ jobs:
               TRIPLE="arm-linux-androideabi"
             fi
 
-            SSL_LIB="$SYSROOT/usr/lib/$TRIPLE/libssl.a"
-            CRYPTO_LIB="$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
-
-            if [ ! -f "$SSL_LIB" ]; then
-              KDAB_LIB="$PWD/../android_openssl-master/ssl_3/$ABI"
-              cp "$KDAB_LIB/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
-              cp "$KDAB_LIB/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
-            fi
-
-            cp -rn "$OPENSSL_INCLUDE/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
+            cp "$OPENSSL_ROOT/$ABI/lib/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
+            cp "$OPENSSL_ROOT/$ABI/lib/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
+            cp -rn "$OPENSSL_ROOT/$ABI/include/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
 
             OUT="shell-native/build/$ABI"
             mkdir -p "$OUT"
@@ -123,7 +118,6 @@ jobs:
               -DANDROID_ABI="$ABI" \
               -DANDROID_PLATFORM="android-21" \
               -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-undefined" \
               -GNinja
 
             $CMAKE --build "$OUT/.cmake"
