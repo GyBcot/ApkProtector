@@ -1,0 +1,168 @@
+name: ApkProtector
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag source apk (kosongkan untuk ambil terbaru)'
+        required: false
+        default: ''
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get Release Info
+        id: release
+        run: |
+          INPUT_TAG="${{ github.event.inputs.release_tag }}"
+          if [ -z "$INPUT_TAG" ]; then
+            RELEASE_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          else
+            RELEASE_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${INPUT_TAG}")
+          fi
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          ASSET_ID=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .id' | head -1)
+          APK_NAME=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .name' | head -1)
+          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "asset_id=$ASSET_ID" >> $GITHUB_OUTPUT
+          echo "apk_name=$APK_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download APK from Release
+        run: |
+          mkdir -p input
+          curl -L \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            -o "input/${{ steps.release.outputs.apk_name }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/assets/${{ steps.release.outputs.asset_id }}"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Generate Keystore
+        run: |
+          keytool -genkey -v \
+            -keystore rscoders.keystore \
+            -alias rscoders \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 36500 \
+            -dname "CN=RidwanzSaputra, OU=RSCoders, O=RSCoders, L=Kebumen, ST=Jawa Tengah, C=ID" \
+            -storepass @Ridwanz45rs \
+            -keypass @Ridwanz45rs
+
+      - name: Clone ApkProtector
+        run: |
+          git clone https://github.com/GyBcot/ApkProtector
+          cd ApkProtector
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Setup Android NDK
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;27.1.12297006" \
+            "build-tools;36.1.0" \
+            "cmake;3.22.1" || true
+
+      - name: Install OpenSSL for Android
+        run: |
+          NDK_VER="27.1.12297006"
+          NDK="$ANDROID_HOME/ndk/$NDK_VER"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          echo "NDK27=$NDK" >> $GITHUB_ENV
+          echo "SYSROOT27=$SYSROOT" >> $GITHUB_ENV
+          OPENSSL_TAG="2024.09.04"
+          OPENSSL_VER="3.3.2"
+          wget -q "https://github.com/217heidai/openssl_for_android/releases/download/${OPENSSL_TAG}/openssl_static_android_${OPENSSL_VER}.zip" -O openssl.zip
+          unzip -q openssl.zip
+          echo "OPENSSL_ROOT=$PWD/openssl_static_android_${OPENSSL_VER}" >> $GITHUB_ENV
+
+      - name: Build ApkProtector Native Shell
+        run: |
+          cd ApkProtector
+
+          NDK="$NDK27"
+          TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
+          SYSROOT="$SYSROOT27"
+
+          SDK_CMAKE="$(ls -d $ANDROID_HOME/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+          CMAKE="${SDK_CMAKE:+$SDK_CMAKE/}cmake"
+
+          for ABI in arm64-v8a armeabi-v7a; do
+            if [ "$ABI" = "arm64-v8a" ]; then
+              TRIPLE="aarch64-linux-android"
+            else
+              TRIPLE="arm-linux-androideabi"
+            fi
+
+            cp "$OPENSSL_ROOT/$ABI/lib/libssl.a"    "$SYSROOT/usr/lib/$TRIPLE/libssl.a"
+            cp "$OPENSSL_ROOT/$ABI/lib/libcrypto.a" "$SYSROOT/usr/lib/$TRIPLE/libcrypto.a"
+            cp -rn "$OPENSSL_ROOT/$ABI/include/openssl" "$SYSROOT/usr/include/openssl" 2>/dev/null || true
+
+            OUT="shell-native/build/$ABI"
+            mkdir -p "$OUT"
+
+            $CMAKE -S shell-native -B "$OUT/.cmake" \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM="android-21" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -GNinja
+
+            $CMAKE --build "$OUT/.cmake"
+            cp "$OUT/.cmake/librscoders.so" "$OUT/librscoders.so"
+            echo "   -> $OUT/librscoders.so"
+          done
+
+      - name: Build ApkProtector Stub DEX
+        run: |
+          cd ApkProtector
+          chmod +x shell-stub/build-stub.sh
+          ./shell-stub/build-stub.sh
+
+      - name: Build ApkProtector CLI
+        run: |
+          cd ApkProtector
+          chmod +x gradlew
+          ./gradlew :packer-cli:installDist
+
+      - name: Harden APK with ApkProtector
+        id: harden
+        run: |
+          APK_BASENAME=$(basename "${{ steps.release.outputs.apk_name }}" .apk)
+          HARDENED_NAME="${APK_BASENAME}_protected.apk"
+          mkdir -p hardened
+          ApkProtector/packer-cli/build/install/rscoders/bin/rscoders \
+            -i "input/${{ steps.release.outputs.apk_name }}" \
+            -o "hardened/${HARDENED_NAME}" \
+            --stub-dex ApkProtector/shell-stub/build/classes.dex \
+            --shell-arm64 ApkProtector/shell-native/build/arm64-v8a/librscoders.so \
+            --shell-arm32 ApkProtector/shell-native/build/armeabi-v7a/librscoders.so \
+            --ks rscoders.keystore \
+            --ks-pass @Ridwanz45rs \
+            --ks-alias rscoders \
+            --protection default \
+            --no-secure-screen \
+            --ssl-pinning \
+            --ssl-pin ${{ secrets.SSL_PIN_1 }}
+          echo "hardened_path=hardened/${HARDENED_NAME}" >> $GITHUB_OUTPUT
+          echo "hardened_name=${HARDENED_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApkProtector
+          path: ${{ steps.harden.outputs.hardened_path }}
+          retention-days: 7
+          
