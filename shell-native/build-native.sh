@@ -19,7 +19,6 @@ NDK="$SDK/ndk/$NDK_VER"
 TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
 [[ -f "$TOOLCHAIN" ]] || { echo "NDK toolchain not found: $TOOLCHAIN"; exit 1; }
 
-# Prefer the SDK's CMake (bundles ninja); fall back to system cmake + ninja on PATH.
 SDK_CMAKE_DIR="$(ls -d "$SDK"/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
 if [[ -n "${SDK_CMAKE_DIR:-}" ]]; then
   export PATH="$SDK_CMAKE_DIR:$PATH"
@@ -28,7 +27,7 @@ else
   CMAKE="cmake"
 fi
 
-ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+ABIS=("arm64-v8a" "armeabi-v7a")
 MIN_SDK=21
 BUILD_TYPE="Release"
 
@@ -40,8 +39,9 @@ for ABI in "${ABIS[@]}"; do
     -DANDROID_ABI="$ABI" \
     -DANDROID_PLATFORM="android-$MIN_SDK" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    -GNinja >/dev/null
-  "$CMAKE" --build "$OUT/.cmake" >/dev/null
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -GNinja
+  "$CMAKE" --build "$OUT/.cmake"
   cp "$OUT/.cmake/librscoders.so" "$OUT/librscoders.so"
   echo "   -> $OUT/librscoders.so"
 done
