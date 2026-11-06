@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(rscoders SHARED src/rscoders_shell.cpp)
 
 find_library(log-lib log)
-target_link_libraries(rscoders ${log-lib})
+find_library(android-lib android)
 
-# Strip symbols in release to slow down reverse engineering.
+target_link_libraries(rscoders ${log-lib} ${android-lib} z)
+
 target_link_options(rscoders PRIVATE $<$<CONFIG:Release>:-s>)
