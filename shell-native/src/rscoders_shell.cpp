@@ -616,82 +616,152 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
     env->DeleteLocalRef(allAppsCls);
 }
 
-void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHex) {
-    if (expectedHex.empty()) return;
+static std::string getApkPath(JNIEnv* env, jobject context) {
     jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getPm = env->GetMethodID(ctxClass, "getPackageManager",
-        "()Landroid/content/pm/PackageManager;");
-    jmethodID getPkg = env->GetMethodID(ctxClass, "getPackageName", "()Ljava/lang/String;");
-    jobject pm = env->CallObjectMethod(context, getPm);
-    jstring pkg = static_cast<jstring>(env->CallObjectMethod(context, getPkg));
-    jclass pmClass = env->GetObjectClass(pm);
-    jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
-        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
-    jobject pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)0x8000000);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)64);
-    }
-    jclass piClass = env->GetObjectClass(pi);
-    bool matched = false;
-    jfieldID sigInfoField = env->GetFieldID(piClass, "signingInfo",
-        "Landroid/content/pm/SigningInfo;");
-    if (sigInfoField && !env->ExceptionCheck()) {
-        jobject sigInfo = env->GetObjectField(pi, sigInfoField);
-        jclass siClass = env->GetObjectClass(sigInfo);
-        jmethodID getSigners = env->GetMethodID(siClass, "getApkContentsSigners",
-            "()[Landroid/content/pm/Signature;");
-        jobjectArray sigs = static_cast<jobjectArray>(env->CallObjectMethod(sigInfo, getSigners));
-        jclass sigClass = env->FindClass("android/content/pm/Signature");
-        jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
-        jint sigCount = env->GetArrayLength(sigs);
-        for (jint i = 0; i < sigCount && !matched; i++) {
-            jobject sig = env->GetObjectArrayElement(sigs, i);
-            jbyteArray sigBytes = static_cast<jbyteArray>(env->CallObjectMethod(sig, toBytes));
-            jsize len = env->GetArrayLength(sigBytes);
-            std::vector<uint8_t> bytes(len);
-            env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
-            if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
-        }
-        env->DeleteLocalRef(sigInfo);
-        env->DeleteLocalRef(siClass);
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
-    } else {
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        jfieldID sigsField = env->GetFieldID(piClass, "signatures",
-            "[Landroid/content/pm/Signature;");
-        jobjectArray sigs = static_cast<jobjectArray>(env->GetObjectField(pi, sigsField));
-        jclass sigClass = env->FindClass("android/content/pm/Signature");
-        jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
-        jint sigCount = env->GetArrayLength(sigs);
-        for (jint i = 0; i < sigCount && !matched; i++) {
-            jobject sig = env->GetObjectArrayElement(sigs, i);
-            jbyteArray sigBytes = static_cast<jbyteArray>(env->CallObjectMethod(sig, toBytes));
-            jsize len = env->GetArrayLength(sigBytes);
-            std::vector<uint8_t> bytes(len);
-            env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
-            if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
-        }
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
-    }
+    jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo",
+        "()Landroid/content/pm/ApplicationInfo;");
+    jobject appInfo = env->CallObjectMethod(context, getAppInfo);
+    jclass aiClass = env->GetObjectClass(appInfo);
+    jfieldID sourceDirField = env->GetFieldID(aiClass, "sourceDir", "Ljava/lang/String;");
+    jstring sourceDir = static_cast<jstring>(env->GetObjectField(appInfo, sourceDirField));
+    const char* chars = env->GetStringUTFChars(sourceDir, nullptr);
+    std::string path(chars);
+    env->ReleaseStringUTFChars(sourceDir, chars);
+    env->DeleteLocalRef(sourceDir);
+    env->DeleteLocalRef(aiClass);
+    env->DeleteLocalRef(appInfo);
     env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(pm);
-    env->DeleteLocalRef(pkg);
-    env->DeleteLocalRef(pmClass);
-    env->DeleteLocalRef(pi);
-    env->DeleteLocalRef(piClass);
-    if (!matched) tamper("signature-mismatch");
+    return path;
 }
 
-void verifyIntegrity(const std::vector<uint8_t>& payload, const std::string& expectedHex) {
+static bool findEocd(FILE* f, uint32_t& cdOffset, uint16_t& cdCount) {
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    long maxComment = 65535;
+    long searchStart = fileSize - 22 - maxComment;
+    if (searchStart < 0) searchStart = 0;
+
+    for (long pos = fileSize - 22; pos >= searchStart; pos--) {
+        fseek(f, pos, SEEK_SET);
+        uint8_t sig[4];
+        if (fread(sig, 1, 4, f) != 4) continue;
+        if (sig[0] != 0x50 || sig[1] != 0x4B || sig[2] != 0x05 || sig[3] != 0x06) continue;
+        uint8_t eocd[18];
+        if (fread(eocd, 1, 18, f) != 18) continue;
+        uint16_t commentLen = eocd[16] | (eocd[17] << 8);
+        if (pos + 22 + commentLen != fileSize) continue;
+        cdCount  = eocd[6]  | (eocd[7]  << 8);
+        cdOffset = eocd[12] | (eocd[13] << 8) | (eocd[14] << 16) | (eocd[15] << 24);
+        return true;
+    }
+    return false;
+}
+
+static std::vector<uint8_t> readZipEntry(const std::string& apkPath, const std::string& entryName) {
+    FILE* f = fopen(apkPath.c_str(), "rb");
+    if (!f) return {};
+
+    uint32_t cdOffset; uint16_t cdCount;
+    if (!findEocd(f, cdOffset, cdCount)) { fclose(f); return {}; }
+
+    fseek(f, cdOffset, SEEK_SET);
+    for (uint16_t i = 0; i < cdCount; i++) {
+        uint8_t cdh[46];
+        if (fread(cdh, 1, 46, f) != 46) break;
+        if (cdh[0] != 0x50 || cdh[1] != 0x4B || cdh[2] != 0x01 || cdh[3] != 0x02) break;
+
+        uint16_t nameLen     = cdh[28] | (cdh[29] << 8);
+        uint16_t extraLen    = cdh[30] | (cdh[31] << 8);
+        uint16_t commentLen  = cdh[32] | (cdh[33] << 8);
+        uint32_t compSize    = cdh[20] | (cdh[21] << 8) | (cdh[22] << 16) | (cdh[23] << 24);
+        uint32_t localOffset = cdh[42] | (cdh[43] << 8) | (cdh[44] << 16) | (cdh[45] << 24);
+
+        std::string name(nameLen, '\0');
+        if (fread(&name[0], 1, nameLen, f) != nameLen) break;
+        fseek(f, extraLen + commentLen, SEEK_CUR);
+
+        bool isCert = name.size() > 9 &&
+            name.substr(0, 9) == "META-INF/" &&
+            (name.size() >= 4 && (
+                name.substr(name.size() - 4) == ".RSA" ||
+                name.substr(name.size() - 4) == ".DSA" ||
+                name.substr(name.size() - 3) == ".EC"));
+
+        if (!entryName.empty() && name != entryName) continue;
+        if (entryName.empty() && !isCert) continue;
+
+        fseek(f, localOffset + 26, SEEK_SET);
+        uint8_t lh[4];
+        if (fread(lh, 1, 4, f) != 4) break;
+        uint16_t lNameLen  = lh[0] | (lh[1] << 8);
+        uint16_t lExtraLen = lh[2] | (lh[3] << 8);
+
+        fseek(f, localOffset + 30 + lNameLen + lExtraLen, SEEK_SET);
+        std::vector<uint8_t> data(compSize);
+        if (fread(data.data(), 1, compSize, f) != compSize) break;
+
+        fclose(f);
+        return data;
+    }
+    fclose(f);
+    return {};
+}
+
+static std::string sha256HexNative(const uint8_t* data, size_t len) {
+    JNIEnv* env = nullptr;
+    int attachResult = g_refs.vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    bool needDetach = false;
+    if (attachResult == JNI_EDETACHED) {
+        g_refs.vm->AttachCurrentThread(&env, nullptr);
+        needDetach = true;
+    }
+    jclass mdClass = env->FindClass("java/security/MessageDigest");
+    jmethodID getInstance = env->GetStaticMethodID(mdClass, "getInstance",
+        "(Ljava/lang/String;)Ljava/security/MessageDigest;");
+    jstring algo = env->NewStringUTF("SHA-256");
+    jobject md = env->CallStaticObjectMethod(mdClass, getInstance, algo);
+    jmethodID digestMethod = env->GetMethodID(mdClass, "digest", "([B)[B");
+    jbyteArray input = env->NewByteArray(static_cast<jsize>(len));
+    env->SetByteArrayRegion(input, 0, static_cast<jsize>(len),
+        reinterpret_cast<const jbyte*>(data));
+    jbyteArray result = static_cast<jbyteArray>(env->CallObjectMethod(md, digestMethod, input));
+    jsize rlen = env->GetArrayLength(result);
+    std::vector<uint8_t> out(rlen);
+    env->GetByteArrayRegion(result, 0, rlen, reinterpret_cast<jbyte*>(out.data()));
+    env->DeleteLocalRef(result);
+    env->DeleteLocalRef(input);
+    env->DeleteLocalRef(md);
+    env->DeleteLocalRef(algo);
+    env->DeleteLocalRef(mdClass);
+    if (needDetach) g_refs.vm->DetachCurrentThread();
+    static const char hex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(out.size() * 2);
+    for (uint8_t b : out) { s += hex[b >> 4]; s += hex[b & 0xF]; }
+    return s;
+}
+
+void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHex) {
     if (expectedHex.empty()) return;
-    if (bytesToHex(sha256Digest(payload)) != expectedHex) tamper("payload-integrity");
+
+    std::string apkPath = getApkPath(env, context);
+
+    std::vector<uint8_t> certData;
+
+    const char* candidates[] = {
+        "META-INF/RSCODERS.RSA",
+        nullptr
+    };
+    for (int i = 0; candidates[i] && certData.empty(); i++)
+        certData = readZipEntry(apkPath, candidates[i]);
+
+    if (certData.empty())
+        certData = readZipEntry(apkPath, "");
+
+    if (certData.empty()) tamper("cert-missing");
+
+    if (sha256HexNative(certData.data(), certData.size()) != expectedHex)
+        tamper("signature-mismatch");
 }
 
 #if defined(__LP64__)
