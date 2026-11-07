@@ -77,13 +77,9 @@ class HardeningPipeline(
             )
 
             val p = config.protection
+            val ssl = p.sslPinning
             val fingerprint = UUID.randomUUID().toString()
             val payloadSha = CertFingerprint.sha256Hex(payload)
-
-            val sslPinsValue = if (p.sslPinning && config.sslPins.isNotEmpty()) {
-                config.sslPins.joinToString(",")
-            } else ""
-
             val propsBytes = buildString {
                 appendLine("rscoders.version=1")
                 appendLine("rscoders.originalApplication=${patched.originalApplicationClass ?: ""}")
@@ -104,19 +100,44 @@ class HardeningPipeline(
                 appendLine("guard.doubleOpenDetection=${p.doubleOpenDetection}")
                 appendLine("guard.accessibilityDetection=${p.accessibilityDetection}")
                 appendLine("guard.logSuppression=${p.logSuppression}")
-                appendLine("guard.sslPinning=${p.sslPinning && sslPinsValue.isNotEmpty()}")
-                appendLine("guard.sslPins=$sslPinsValue")
-                appendLine("guard.sslPinsHex=$sslPinsValue")
                 appendLine("guard.protectedAssets=${protectedNames.joinToString(",")}")
                 appendLine("guard.protectedSo=${soNames.joinToString(",")}")
+                appendLine("guard.sslPinning=${ssl.enabled}")
+                appendLine("guard.sslPinningEnforce=${ssl.enforcePinning}")
+                appendLine("guard.sslPinningAllowUserCerts=${ssl.allowUserCerts}")
+                if (ssl.enabled && ssl.pins.isNotEmpty()) {
+                    val pinsJson = buildString {
+                        append("[")
+                        ssl.pins.forEachIndexed { idx, pin ->
+                            if (idx > 0) append(",")
+                            append("{")
+                            append("\"host\":\"${pin.hostname}\",")
+                            append("\"sub\":${pin.includeSubdomains},")
+                            append("\"pins\":[${pin.sha256Pins.joinToString(",") { "\"$it\"" }}]")
+                            append("}")
+                        }
+                        append("]")
+                    }
+                    appendLine("guard.sslPins=$pinsJson")
+                }
             }.toByteArray()
 
-            if (p.sslPinning && config.sslPins.isNotEmpty()) {
+            if (ssl.enabled && ssl.pins.isNotEmpty()) {
                 steps += StepReport(
                     "ssl-pinning",
-                    "SPKI pins=${config.sslPins.size}: ${config.sslPins.joinToString(",") { it.take(16) + "..." }}",
+                    "${ssl.pins.size} host(s) pinned, enforce=${ssl.enforcePinning}",
                 )
             }
+
+            steps += StepReport(
+                "guard",
+                "fingerprint=${fingerprint.take(8)}… " +
+                    "sig=${p.signatureVerification && certSha != null} integ=${p.fileIntegrityVerification} " +
+                    "debug=${p.debuggingDetection} ptrace=${p.antiPtrace} frida=${p.antiReverseTools} " +
+                    "root=${p.rootDetection} emu=${p.emulatorDetection} flagsecure=${p.screenCapturePrevention} " +
+                    "hijack=${p.antiHijacking} dblopen=${p.doubleOpenDetection} a11y=${p.accessibilityDetection} " +
+                    "logsuppress=${p.logSuppression} sslpin=${ssl.enabled}",
+            )
 
             val propsKey = derivePropsKey(kek)
             val encryptedProps = AesGcm.encrypt(propsKey, propsBytes)
