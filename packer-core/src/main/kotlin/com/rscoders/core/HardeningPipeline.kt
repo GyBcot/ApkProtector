@@ -79,6 +79,11 @@ class HardeningPipeline(
             val p = config.protection
             val fingerprint = UUID.randomUUID().toString()
             val payloadSha = CertFingerprint.sha256Hex(payload)
+
+            val sslPinsValue = if (p.sslPinning && config.sslPins.isNotEmpty()) {
+                config.sslPins.joinToString(",")
+            } else ""
+
             val propsBytes = buildString {
                 appendLine("rscoders.version=1")
                 appendLine("rscoders.originalApplication=${patched.originalApplicationClass ?: ""}")
@@ -99,18 +104,18 @@ class HardeningPipeline(
                 appendLine("guard.doubleOpenDetection=${p.doubleOpenDetection}")
                 appendLine("guard.accessibilityDetection=${p.accessibilityDetection}")
                 appendLine("guard.logSuppression=${p.logSuppression}")
+                appendLine("guard.sslPinning=${p.sslPinning && sslPinsValue.isNotEmpty()}")
+                appendLine("guard.sslPins=$sslPinsValue")
                 appendLine("guard.protectedAssets=${protectedNames.joinToString(",")}")
                 appendLine("guard.protectedSo=${soNames.joinToString(",")}")
             }.toByteArray()
-            steps += StepReport(
-                "guard",
-                "fingerprint=${fingerprint.take(8)}… " +
-                    "sig=${p.signatureVerification && certSha != null} integ=${p.fileIntegrityVerification} " +
-                    "debug=${p.debuggingDetection} ptrace=${p.antiPtrace} frida=${p.antiReverseTools} " +
-                    "root=${p.rootDetection} emu=${p.emulatorDetection} flagsecure=${p.screenCapturePrevention} " +
-                    "hijack=${p.antiHijacking} dblopen=${p.doubleOpenDetection} a11y=${p.accessibilityDetection} " +
-                    "logsuppress=${p.logSuppression}",
-            )
+
+            if (p.sslPinning && config.sslPins.isNotEmpty()) {
+                steps += StepReport(
+                    "ssl-pinning",
+                    "SPKI pins=${config.sslPins.size}: ${config.sslPins.joinToString(",") { it.take(16) + "..." }}",
+                )
+            }
 
             val propsKey = derivePropsKey(kek)
             val encryptedProps = AesGcm.encrypt(propsKey, propsBytes)
