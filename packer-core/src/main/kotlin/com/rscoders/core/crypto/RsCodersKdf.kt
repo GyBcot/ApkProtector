@@ -449,7 +449,7 @@ object RsCodersKdf {
         val len = data.size; val blen = ((len+8)/64+1)*64
         val buf = ByteArray(blen); data.copyInto(buf); buf[len]=0x80.toByte()
         var bits = len.toLong()*8
-        for (i in 0 until 8) { buf[blen-1-i]=(bits%256).toByte(); bits/=256 }
+        for (i in 0 until 8) { buf[blen-1-i]=(bits%256).toInt().toByte(); bits/=256 }
         var i=0
         while (i < blen) {
             val W=IntArray(64)
