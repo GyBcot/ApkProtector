@@ -109,9 +109,7 @@ jobs:
             --ks-pass @Ridwanz45rs \
             --ks-alias rscoders \
             --protection default \
-            --no-secure-screen \
-            --ssl-pinning \
-            --ssl-pin ${{ secrets.SSL_PIN_1 }}
+            --no-secure-screen
           echo "hardened_path=hardened/${HARDENED_NAME}" >> $GITHUB_OUTPUT
           echo "hardened_name=${HARDENED_NAME}" >> $GITHUB_OUTPUT
 
