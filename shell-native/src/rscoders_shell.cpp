@@ -22,10 +22,6 @@
 #include <android/dlext.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#include <openssl/evp.h>
-#include <openssl/sha.h>
 #include "ca_crypto.h"
 
 #define LOG_TAG "RSCoders"
@@ -45,7 +41,6 @@ static volatile bool g_screenCapturePrevention = false;
 static volatile bool g_antiHijacking = false;
 static volatile jobject g_realAppRef = nullptr;
 static std::vector<std::string> g_sslPins;
-static SSL_CTX* g_sslCtx = nullptr;
 
 struct GlobalRefs {
     JavaVM* vm = nullptr;
@@ -321,54 +316,94 @@ void installAntiPtrace() {
     }
 }
 
-static std::string computeSpkiHash(X509* cert) {
-    EVP_PKEY* pkey = X509_get_pubkey(cert);
-    if (!pkey) return "";
-    int len = i2d_PUBKEY(pkey, nullptr);
-    if (len <= 0) { EVP_PKEY_free(pkey); return ""; }
-    std::vector<uint8_t> der(static_cast<size_t>(len));
-    uint8_t* p = der.data();
-    i2d_PUBKEY(pkey, &p);
-    EVP_PKEY_free(pkey);
-    uint8_t digest[SHA256_DIGEST_LENGTH];
-    SHA256(der.data(), der.size(), digest);
-    static const char hexChars[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(SHA256_DIGEST_LENGTH * 2);
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        out += hexChars[digest[i] >> 4];
-        out += hexChars[digest[i] & 0xF];
-    }
-    return out;
-}
-
-static int sslVerifyCallback(int preverifyOk, X509_STORE_CTX* ctx) {
-    if (!preverifyOk) return 0;
-    if (g_sslPins.empty()) return preverifyOk;
-    X509* cert = X509_STORE_CTX_get0_cert(ctx);
-    if (!cert) { tamper("ssl-no-cert"); return 0; }
-    std::string spki = computeSpkiHash(cert);
-    if (spki.empty()) { tamper("ssl-spki-fail"); return 0; }
-    for (const auto& pin : g_sslPins) {
-        if (pin == spki) return 1;
-    }
-    tamper("ssl-pin-mismatch");
-    return 0;
-}
-
-static void installSslPinning(const std::string& pinsStr) {
+static void installSslPinning(JNIEnv* env, jobject context, const std::string& pinsStr) {
     if (pinsStr.empty()) return;
+
     std::istringstream ss(pinsStr);
     std::string pin;
     while (std::getline(ss, pin, ',')) {
         if (!pin.empty()) g_sslPins.push_back(pin);
     }
     if (g_sslPins.empty()) return;
-    g_sslCtx = SSL_CTX_new(TLS_client_method());
-    if (!g_sslCtx) { tamper("ssl-ctx-fail"); return; }
-    SSL_CTX_set_verify(g_sslCtx, SSL_VERIFY_PEER, sslVerifyCallback);
-    SSL_CTX_set_verify_depth(g_sslCtx, 5);
-    LOGW("SSL pinning installed: %zu pin(s)", g_sslPins.size());
+
+    jclass networkSecurityClass = env->FindClass("android/security/NetworkSecurityPolicy");
+    if (networkSecurityClass && !env->ExceptionCheck()) {
+        jmethodID getInstance = env->GetStaticMethodID(networkSecurityClass, "getInstance",
+            "()Landroid/security/NetworkSecurityPolicy;");
+        if (getInstance && !env->ExceptionCheck()) {
+            jobject policy = env->CallStaticObjectMethod(networkSecurityClass, getInstance);
+            jmethodID setCleartext = env->GetMethodID(networkSecurityClass,
+                "setCleartextTrafficPermitted", "(Z)V");
+            if (setCleartext && !env->ExceptionCheck()) {
+                env->CallVoidMethod(policy, setCleartext, JNI_FALSE);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(policy);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(networkSecurityClass);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    LOGW("SSL pinning installed via JNI: %zu pin(s)", g_sslPins.size());
+}
+
+static bool verifySslPinJni(JNIEnv* env, jobject chain) {
+    if (g_sslPins.empty()) return true;
+
+    jclass chainClass = env->GetObjectClass(chain);
+    jmethodID getSize = env->GetMethodID(chainClass, "size", "()I");
+    jmethodID get = env->GetMethodID(chainClass, "get", "(I)Ljava/lang/Object;");
+    jint size = env->CallIntMethod(chain, getSize);
+    env->DeleteLocalRef(chainClass);
+
+    jclass x509Class = env->FindClass("java/security/cert/X509Certificate");
+    jmethodID getPublicKey = env->GetMethodID(x509Class, "getPublicKey", "()Ljava/security/PublicKey;");
+    jclass keyFactoryClass = env->FindClass("java/security/KeyFactory");
+    jmethodID kfGetInstance = env->GetStaticMethodID(keyFactoryClass, "getInstance",
+        "(Ljava/lang/String;)Ljava/security/KeyFactory;");
+    jclass x509SpecClass = env->FindClass("java/security/spec/X509EncodedKeySpec");
+    jmethodID x509SpecCtor = env->GetMethodID(x509SpecClass, "<init>", "([B)V");
+    jclass pubKeyClass = env->FindClass("java/security/PublicKey");
+    jmethodID getEncoded = env->GetMethodID(pubKeyClass, "getEncoded", "()[B");
+    jclass mdClass = env->FindClass("java/security/MessageDigest");
+    jmethodID mdGetInstance = env->GetStaticMethodID(mdClass, "getInstance",
+        "(Ljava/lang/String;)Ljava/security/MessageDigest;");
+    jmethodID digestMethod = env->GetMethodID(mdClass, "digest", "([B)[B");
+    jstring sha256Str = env->NewStringUTF("SHA-256");
+    jobject md = env->CallStaticObjectMethod(mdClass, mdGetInstance, sha256Str);
+
+    bool matched = false;
+    for (jint i = 0; i < size && !matched; i++) {
+        jobject cert = env->CallObjectMethod(chain, get, i);
+        jobject pubKey = env->CallObjectMethod(cert, getPublicKey);
+        jbyteArray encoded = static_cast<jbyteArray>(env->CallObjectMethod(pubKey, getEncoded));
+        jbyteArray digest = static_cast<jbyteArray>(env->CallObjectMethod(md, digestMethod, encoded));
+
+        jsize dlen = env->GetArrayLength(digest);
+        std::vector<uint8_t> dbytes(static_cast<size_t>(dlen));
+        env->GetByteArrayRegion(digest, 0, dlen, reinterpret_cast<jbyte*>(dbytes.data()));
+        std::string hexPin = bytesToHex(dbytes);
+
+        for (const auto& p : g_sslPins) {
+            if (p == hexPin) { matched = true; break; }
+        }
+
+        env->DeleteLocalRef(digest);
+        env->DeleteLocalRef(encoded);
+        env->DeleteLocalRef(pubKey);
+        env->DeleteLocalRef(cert);
+    }
+
+    env->DeleteLocalRef(sha256Str);
+    env->DeleteLocalRef(md);
+    env->DeleteLocalRef(mdClass);
+    env->DeleteLocalRef(pubKeyClass);
+    env->DeleteLocalRef(x509SpecClass);
+    env->DeleteLocalRef(keyFactoryClass);
+    env->DeleteLocalRef(x509Class);
+
+    return matched;
 }
 
 static int getAndroidApiLevel(JNIEnv* env) {
@@ -1065,7 +1100,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     injectDex(env, context, dexBlobs);
 
     if (propFlag(props, "guard.sslPinning")) {
-        installSslPinning(propStr(props, "guard.sslPins"));
+        installSslPinning(env, context, propStr(props, "guard.sslPins"));
     }
 
     g_screenCapturePrevention = propFlag(props, "guard.screenCapturePrevention");
@@ -1306,6 +1341,11 @@ JNIEXPORT jboolean JNICALL
 Java_com_rscoders_stub_StubApp_nativeInstallSoHook(JNIEnv*, jclass) {
     installSoHook();
     return g_realDlopenExt ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_rscoders_stub_StubApp_nativeVerifySslPin(JNIEnv* env, jclass, jobject chain) {
+    return verifySslPinJni(env, chain) ? JNI_TRUE : JNI_FALSE;
 }
 
 }
