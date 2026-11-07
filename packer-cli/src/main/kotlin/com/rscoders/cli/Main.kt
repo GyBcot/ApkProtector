@@ -52,6 +52,14 @@ class Harden : CliktCommand(name = "harden") {
         "--protect-so",
         help = "encrypt the app's own native libraries (transparent in-memory load)",
     ).flag(default = false)
+    private val sslPinning by option(
+        "--ssl-pinning",
+        help = "enable SSL pinning using SPKI public key hash",
+    ).flag(default = false)
+    private val sslPin by option(
+        "--ssl-pin",
+        help = "SPKI SHA-256 hex pin (repeatable)",
+    ).multiple()
 
     override fun run() {
         val shells = buildMap {
@@ -79,7 +87,12 @@ class Harden : CliktCommand(name = "harden") {
             accessibilityDetection = base.accessibilityDetection || accessibility,
             logSuppression = base.logSuppression || logSuppress,
             screenCapturePrevention = if (noSecureScreen) false else base.screenCapturePrevention,
+            sslPinning = base.sslPinning || sslPinning,
         )
+
+        if (protection.sslPinning && sslPin.isEmpty()) {
+            echo("WARNING: --ssl-pinning enabled but no --ssl-pin provided; SSL pinning will be skipped.")
+        }
 
         val pipeline = HardeningPipeline(AndroidSdk.locate())
         val result = pipeline.harden(
@@ -94,16 +107,18 @@ class Harden : CliktCommand(name = "harden") {
                 protectNativeLibs = protectSo,
                 keepWorkDir = keepWork,
                 workDir = if (keepWork) File("work/cli") else null,
+                sslPins = sslPin,
             ),
         )
 
-        echo("✔ hardened: ${result.outputApk}")
+        echo("hardened: ${result.outputApk}")
         echo("  original Application : ${result.originalApplicationClass ?: "<default>"}")
         echo("  encrypted DEX        : ${result.encryptedDexCount}")
         echo("  payload              : ${result.payloadBytes} bytes")
         echo("  signed               : ${result.signed}")
         echo("  screen capture       : ${if (protection.screenCapturePrevention) "disabled" else "allowed"}")
-        result.steps.forEach { echo("  • ${it.name}: ${it.detail}") }
+        echo("  ssl pinning          : ${if (protection.sslPinning && sslPin.isNotEmpty()) "enabled (${sslPin.size} pin(s))" else "disabled"}")
+        result.steps.forEach { echo("  - ${it.name}: ${it.detail}") }
     }
 }
 
