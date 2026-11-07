@@ -38,6 +38,8 @@ public final class StubApp extends Application {
         nativeOnCreate(this);
     }
 
+    public static final ThreadLocal<String> currentHost = new ThreadLocal<String>();
+
     public static class PinningTrustManager implements javax.net.ssl.X509TrustManager {
         private final javax.net.ssl.X509TrustManager systemTm;
         private final boolean allowUserCerts;
@@ -71,8 +73,6 @@ public final class StubApp extends Application {
         }
     }
 
-    public static final ThreadLocal<String> currentHost = new ThreadLocal<>();
-
     public static class PinningSSLSocketFactory extends javax.net.ssl.SSLSocketFactory {
         private final javax.net.ssl.SSLSocketFactory delegate;
 
@@ -80,10 +80,15 @@ public final class StubApp extends Application {
             this.delegate = delegate;
         }
 
-        private java.net.Socket wrapSocket(java.net.Socket s, String host) throws java.io.IOException {
+        private java.net.Socket wrapSocket(java.net.Socket s, final String host) throws java.io.IOException {
             if (s instanceof javax.net.ssl.SSLSocket) {
-                javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket) s;
-                ssl.addHandshakeCompletedListener(event -> currentHost.remove());
+                final javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket) s;
+                ssl.addHandshakeCompletedListener(new javax.net.ssl.HandshakeCompletedListener() {
+                    @Override
+                    public void handshakeCompleted(javax.net.ssl.HandshakeCompletedEvent event) {
+                        currentHost.remove();
+                    }
+                });
                 currentHost.set(host);
             }
             return s;
@@ -154,10 +159,14 @@ public final class StubApp extends Application {
             javax.net.ssl.SSLContext.setDefault(sslCtx);
             javax.net.ssl.HttpsURLConnection.setDefaultSSLSocketFactory(
                     new PinningSSLSocketFactory(sslCtx.getSocketFactory()));
-            javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> {
-                currentHost.set(hostname);
-                return true;
-            });
+            javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier(
+                    new javax.net.ssl.HostnameVerifier() {
+                        @Override
+                        public boolean verify(String hostname, javax.net.ssl.SSLSession session) {
+                            currentHost.set(hostname);
+                            return true;
+                        }
+                    });
         } catch (Exception ignored) {}
     }
 }
