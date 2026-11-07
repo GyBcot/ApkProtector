@@ -319,7 +319,7 @@ object RsCodersKdf {
     }
 
     private val BLAKE3_IV = intArrayOf(
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372.toInt(), 0xa54ff53a.toInt(),
+        0x6a09e667, 0xbb67ae85.toInt(), 0x3c6ef372.toInt(), 0xa54ff53a.toInt(),
         0x510e527f, 0x9b05688c.toInt(), 0x1f83d9ab, 0x5be0cd19
     )
     private val BLAKE3_MSG_PERM = intArrayOf(2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8)
