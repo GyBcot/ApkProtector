@@ -53,7 +53,7 @@ object RsCodersKdf {
         return intArrayOf(v0h,v0l,v1h,v1l,v2h,v2l,v3h,v3l)
     }
 
-    fun siphashTag(input: ByteArray): String {
+    fun siphashRaw(input: ByteArray): ByteArray {
         val kh0 = K0[0] xor K0[4]; val kl0 = K0[1] xor K0[5]
         val kh1 = K0[2] xor K0[6]; val kl1 = K0[3] xor K0[7]
         var v = intArrayOf(
@@ -88,18 +88,21 @@ object RsCodersKdf {
         repeat(4) { v=sipRound(v) }
         val fh = (v[0] xor v[2] xor v[4] xor v[6]).u()
         val fl = (v[1] xor v[3] xor v[5] xor v[7]).u()
-        return fh.toString(16).padStart(8,'0') + fl.toString(16).padStart(8,'0')
+        val out = ByteArray(8)
+        out[0] = (fh and 0xFF).toByte()
+        out[1] = ((fh shr 8) and 0xFF).toByte()
+        out[2] = ((fh shr 16) and 0xFF).toByte()
+        out[3] = ((fh shr 24) and 0xFF).toByte()
+        out[4] = (fl and 0xFF).toByte()
+        out[5] = ((fl shr 8) and 0xFF).toByte()
+        out[6] = ((fl shr 16) and 0xFF).toByte()
+        out[7] = ((fl shr 24) and 0xFF).toByte()
+        return out
     }
 
-    private fun speckRound(x: Int, y: Int, k: Int): Pair<Int, Int> {
-        var nx = x.rr(8)
-        nx = (nx.u() + y.u()).toInt()
-        nx = nx xor k
-        val ny = y.rl(3) xor nx
-        return nx to ny
-    }
+    fun siphashTag(input: ByteArray): String = siphashRaw(input).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
 
-    fun speckEnc(hexStr: String): String {
+    private fun speckEncRaw(input: ByteArray): ByteArray {
         val k0=K0[0] xor K1[0]; val k1=K0[1] xor K1[1]
         val k2=K0[2] xor K1[2]; val k3=K0[3] xor K1[3]
         val sched = mutableListOf<Int>()
@@ -113,18 +116,28 @@ object RsCodersKdf {
             }
         }
         val ks = sched.take(27)
-        val w = mutableListOf<Int>()
-        var i = 0
-        while (i + 8 <= hexStr.length) {
-            w.add(hexStr.substring(i, i+8).toLong(16).toInt())
-            i += 8
+        val out = ByteArray(input.size)
+        for (i in input.indices) {
+            val kb = (ks[i % ks.size] ushr ((i % 4) * 8)) and 0xFF
+            out[i] = (input[i].toInt() xor kb).toByte()
         }
-        var x = w.getOrElse(0){0}; var y = w.getOrElse(1){0}
-        for (k in ks) { val r=speckRound(x,y,k); x=r.first; y=r.second }
-        return x.u().toString(16).padStart(8,'0') + y.u().toString(16).padStart(8,'0')
+        return out
     }
 
-    fun chacha20Enc(hexStr: String): String {
+    fun speckEnc(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return speckEncRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun speckRound(x: Int, y: Int, k: Int): Pair<Int, Int> {
+        var nx = x.rr(8)
+        nx = (nx.u() + y.u()).toInt()
+        nx = nx xor k
+        val ny = y.rl(3) xor nx
+        return nx to ny
+    }
+
+    private fun chacha20EncRaw(input: ByteArray): ByteArray {
         fun qr(s: IntArray, a: Int, b: Int, c: Int, dd: Int, n: Int) {
             s[a]=(s[a]+s[b]); s[dd]=s[dd] xor s[a]; s[dd]=s[dd].rl(n)
             s[c]=(s[c]+s[dd]); s[b]=s[b] xor s[c]; s[b]=s[b].rl(32-n)
@@ -141,46 +154,61 @@ object RsCodersKdf {
             qr(w,2,7,8,13,8);   qr(w,3,4,9,14,7)
         }
         for (i in 0 until 16) w[i]=(w[i]+s[i])
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
-        val sb = StringBuilder()
-        for (i in bytes.indices) {
+        val out = ByteArray(input.size)
+        for (i in input.indices) {
             val kb = (w[i ushr 2] ushr ((i and 3)*8)) and 0xFF
-            sb.append((bytes[i] xor kb).toString(16).padStart(2,'0'))
+            out[i] = (input[i].toInt() xor kb).toByte()
         }
-        return sb.toString()
+        return out
     }
 
-    fun poly1305Tag(str: String, keyHex: String): String {
+    fun chacha20Enc(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return chacha20EncRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun poly1305TagRaw(input: ByteArray): ByteArray {
+        val kbytes = ByteArray(32)
+        for (i in 0 until 8) {
+            val v = K0[i]
+            kbytes[i*4+0] = (v and 0xFF).toByte()
+            kbytes[i*4+1] = ((v ushr 8) and 0xFF).toByte()
+            kbytes[i*4+2] = ((v ushr 16) and 0xFF).toByte()
+            kbytes[i*4+3] = ((v ushr 24) and 0xFF).toByte()
+        }
         val P  = java.math.BigInteger("3fffffffffffffffffffffffffffffffb", 16)
         val M  = java.math.BigInteger("ffffffffffffffffffffffffffffffff", 16)
         val CL = java.math.BigInteger("0ffffffc0ffffffc0ffffffc0fffffff", 16)
-        val kBytes = keyHex.padEnd(64,'0').substring(0,64).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
         fun lu(buf: ByteArray, off: Int, n: Int): java.math.BigInteger {
             var v = java.math.BigInteger.ZERO
             for (j in 0 until n) if (off+j < buf.size)
                 v = v.or(java.math.BigInteger.valueOf((buf[off+j].toInt() and 0xFF).toLong()).shiftLeft(j*8))
             return v
         }
-        val r = lu(kBytes,0,16).and(CL)
-        val s = lu(kBytes,16,16)
-        val bytes = str.toByteArray(Charsets.UTF_8)
+        val r = lu(kbytes,0,16).and(CL)
+        val s = lu(kbytes,16,16)
         var acc = java.math.BigInteger.ZERO
         var i = 0
-        while (i < bytes.size) {
-            val end = minOf(i+16, bytes.size)
-            var chunk = lu(bytes,i,end-i)
+        while (i < input.size) {
+            val end = minOf(i+16, input.size)
+            var chunk = lu(input,i,end-i)
             chunk = chunk.or(java.math.BigInteger.ONE.shiftLeft((end-i)*8))
             acc = acc.add(chunk).multiply(r).mod(P)
             i += 16
         }
         acc = acc.add(s).and(M)
-        val sb = StringBuilder()
+        val out = ByteArray(16)
         var tmp = acc
-        repeat(16) {
-            sb.append((tmp.and(java.math.BigInteger.valueOf(0xFF)).toInt()).toString(16).padStart(2,'0'))
+        for (j in 0 until 16) {
+            out[j] = (tmp.and(java.math.BigInteger.valueOf(0xFF)).toInt()).toByte()
             tmp = tmp.shiftRight(8)
         }
-        return sb.toString()
+        return out
+    }
+
+    fun poly1305Tag(str: String, keyHex: String): String {
+        val bytes = str.toByteArray(Charsets.UTF_8)
+        return poly1305TagRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private fun mul32(a: Int, b: Int): Int {
@@ -199,7 +227,7 @@ object RsCodersKdf {
         return Triple(na,nb,nc)
     }
 
-    fun customRcEnc(hexStr: String): String {
+    private fun customRcEncRaw(input: ByteArray): ByteArray {
         val k0=K0[0] xor K1[2]; val k1=K0[3] xor K1[1]
         val k2=K0[5] xor K1[7]; val k3=K0[6] xor K1[4]
         val s = intArrayOf(k0,k1,k2,k3,k0 xor k2,k1 xor k3,k0 xor k1 xor 0xdeadbeef.toInt(),k2 xor k3 xor 0xcafebabe.toInt())
@@ -210,17 +238,21 @@ object RsCodersKdf {
             if (i%3==0) sched.add(s[(i+1)%8])
         }
         val state = intArrayOf(K0[1] xor K1[3],K0[4] xor K1[6],K0[7] xor K1[0],K0[2] xor K1[5])
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
-        val sb = StringBuilder()
-        for (i in bytes.indices) {
+        val out = ByteArray(input.size)
+        for (i in input.indices) {
             val si=i%4; val ki=i%sched.size
             val t=rcMix(state[si],sched[ki],state[(si+2)%4])
             state[si]=t.first; state[(si+1)%4]=t.second
             if (t.third and 1 != 0) { val tmp=state[(si+2)%4]; state[(si+2)%4]=state[(si+3)%4]; state[(si+3)%4]=tmp }
             val kb = (t.first xor t.second xor t.third) and 0xFF
-            sb.append((bytes[i] xor kb).toString(16).padStart(2,'0'))
+            out[i] = (input[i].toInt() xor kb).toByte()
         }
-        return sb.toString()
+        return out
+    }
+
+    fun customRcEnc(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return customRcEncRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private val GIMLI_RC = intArrayOf(
@@ -250,26 +282,31 @@ object RsCodersKdf {
         return s
     }
 
-    fun gimliEnc(hexStr: String): String {
+    private fun gimliEncRaw(input: ByteArray): ByteArray {
         val s = intArrayOf(
             K0[0] xor K1[3],K0[2] xor K1[5],K0[4] xor K1[7],K0[6] xor K1[1],
             K0[1] xor K1[4],K0[3] xor K1[6],K0[5] xor K1[0],K0[7] xor K1[2],
             K0[0] xor K1[0],K0[1] xor K1[1],K0[2] xor K1[2],K0[3] xor K1[3]
         )
         gimliPerm(s)
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
         val ks = mutableListOf<Int>()
         for (i in 0 until 4) { val w=s[i]; for (b in 0 until 4) ks.add((w ushr (b*8)) and 0xFF) }
-        var pos = 0; val sb = StringBuilder()
-        for (i in bytes.indices) {
+        var pos = 0
+        val out = ByteArray(input.size)
+        for (i in input.indices) {
             if (pos >= ks.size) {
                 gimliPerm(s); ks.clear()
                 for (j in 0 until 4) { val w=s[j]; for (b in 0 until 4) ks.add((w ushr (b*8)) and 0xFF) }
                 pos=0
             }
-            sb.append((bytes[i] xor ks[pos++]).toString(16).padStart(2,'0'))
+            out[i] = (input[i].toInt() xor ks[pos++]).toByte()
         }
-        return sb.toString()
+        return out
+    }
+
+    fun gimliEnc(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return gimliEncRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private val XOODOO_RC = intArrayOf(
@@ -300,26 +337,36 @@ object RsCodersKdf {
         return s
     }
 
-    fun xoodooTag(hexStr: String): String {
+    private fun xoodooTagRaw(input: ByteArray): ByteArray {
         val s = intArrayOf(
             K0[0] xor K1[1],K0[2] xor K1[3],K0[4] xor K1[5],K0[6] xor K1[7],
             K0[1] xor K1[2],K0[3] xor K1[4],K0[5] xor K1[6],K0[7] xor K1[0],
             0,0,0,0
         )
         xoodooPerm(s)
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
         val bs=16; var i=0
-        while (i < bytes.size) {
-            val block=bytes.subList(i, minOf(i+bs, bytes.size))
-            for (j in block.indices) s[j ushr 2]=s[j ushr 2] xor (block[j] shl ((j and 3)*8))
+        while (i < input.size) {
+            val end = minOf(i+bs, input.size)
+            val block = input.copyOfRange(i, end)
+            for (j in block.indices) s[j ushr 2]=s[j ushr 2] xor ((block[j].toInt() and 0xFF) shl ((j and 3)*8))
             if (block.size < bs) s[block.size ushr 2]=s[block.size ushr 2] xor (0x01 shl ((block.size and 3)*8))
             xoodooPerm(s)
             i += bs
         }
-        if (bytes.size % bs == 0) { s[4]=s[4] xor 0x01; xoodooPerm(s) }
-        val sb=StringBuilder()
-        for (k in 0 until 4) sb.append(s[k].u().toString(16).padStart(8,'0'))
-        return sb.toString()
+        if (input.size % bs == 0) { s[4]=s[4] xor 0x01; xoodooPerm(s) }
+        val out = ByteArray(16)
+        for (k in 0 until 4) {
+            out[k*4+0] = (s[k] and 0xFF).toByte()
+            out[k*4+1] = ((s[k] ushr 8) and 0xFF).toByte()
+            out[k*4+2] = ((s[k] ushr 16) and 0xFF).toByte()
+            out[k*4+3] = ((s[k] ushr 24) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    fun xoodooTag(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return xoodooTagRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private val BLAKE3_IV = intArrayOf(
@@ -352,29 +399,32 @@ object RsCodersKdf {
         return IntArray(8) { v[it] xor v[it+8] }
     }
 
-    fun blake3Enc(hexStr: String): String {
+    private fun blake3EncRaw(input: ByteArray): ByteArray {
         val key = intArrayOf(
             K0[0] xor K1[4],K0[1] xor K1[5],K0[2] xor K1[6],K0[3] xor K1[7],
             K0[4] xor K1[0],K0[5] xor K1[1],K0[6] xor K1[2],K0[7] xor K1[3]
         )
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
-        val sb = StringBuilder(); var ctr=0
-        var i=0
-        while (i < bytes.size) {
+        val out = ByteArray(input.size); var ctr=0; var i=0
+        while (i < input.size) {
             val block=ByteArray(64)
-            val chunk=bytes.subList(i, minOf(i+64, bytes.size))
-            for (j in chunk.indices) block[j]=chunk[j].toByte()
+            val chunk=input.copyOfRange(i, minOf(i+64, input.size))
+            chunk.copyInto(block)
             val ks=blake3Compress(key,block,ctr++,chunk.size,0x0b)
             for (j in chunk.indices) {
                 val kb=(ks[j ushr 2] ushr ((j and 3)*8)) and 0xFF
-                sb.append((chunk[j] xor kb).toString(16).padStart(2,'0'))
+                out[i+j] = (chunk[j].toInt() xor kb).toByte()
             }
             i += 64
         }
-        return sb.toString()
+        return out
     }
 
-    fun chaskeyTag(hexStr: String): String {
+    fun blake3Enc(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return blake3EncRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun chaskeyTagRaw(input: ByteArray): ByteArray {
         fun perm(s: IntArray): IntArray {
             repeat(12) {
                 s[0]=(s[0]+s[1]); s[3]=(s[3] xor s[0]).rl(16)
@@ -398,17 +448,15 @@ object RsCodersKdf {
             (k1s[2].rl(1) xor k1s[3].rl(1) xor (k1s[2] ushr 31) xor (k1s[3] ushr 31)),
             (k1s[3].rl(1) xor k1s[0].rl(1) xor (k1s[3] ushr 31) xor (k1s[0] ushr 31))
         )
-        val bytes = hexStr.chunked(2).map { it.toInt(16) }
         var s = intArrayOf(k0,k1,k2,k3)
-        val bs=16; val len=bytes.size; var i=0
+        val bs=16; val len=input.size; var i=0
         while (i < len) {
             val isLast=(i+bs)>=len
-            val block=IntArray(4)
-            val chunk=bytes.subList(i, minOf(i+bs, bytes.size))
             val arr=ByteArray(16)
-            for (j in chunk.indices) arr[j]=chunk[j].toByte()
-            if (isLast && chunk.size==bs) { s[0]=s[0] xor k1s[0]; s[1]=s[1] xor k1s[1]; s[2]=s[2] xor k1s[2]; s[3]=s[3] xor k1s[3] }
-            else if (isLast) { arr[chunk.size]=0x01; s[0]=s[0] xor k2s[0]; s[1]=s[1] xor k2s[1]; s[2]=s[2] xor k2s[2]; s[3]=s[3] xor k2s[3] }
+            val end = minOf(i+bs, len)
+            input.copyInto(arr, 0, i, end)
+            if (isLast && (end-i)==bs) { s[0]=s[0] xor k1s[0]; s[1]=s[1] xor k1s[1]; s[2]=s[2] xor k1s[2]; s[3]=s[3] xor k1s[3] }
+            else if (isLast) { arr[end-i]=0x01; s[0]=s[0] xor k2s[0]; s[1]=s[1] xor k2s[1]; s[2]=s[2] xor k2s[2]; s[3]=s[3] xor k2s[3] }
             for (j in 0 until 16 step 4) {
                 val w=(arr[j].toInt() and 0xFF) or ((arr[j+1].toInt() and 0xFF) shl 8) or
                       ((arr[j+2].toInt() and 0xFF) shl 16) or ((arr[j+3].toInt() and 0xFF) shl 24)
@@ -418,9 +466,19 @@ object RsCodersKdf {
             i += bs
         }
         s[0]=s[0] xor k1s[0]; s[1]=s[1] xor k1s[1]; s[2]=s[2] xor k1s[2]; s[3]=s[3] xor k1s[3]
-        val sb=StringBuilder()
-        for (k in 0 until 4) sb.append(s[k].u().toString(16).padStart(8,'0'))
-        return sb.toString()
+        val out = ByteArray(16)
+        for (k in 0 until 4) {
+            out[k*4+0] = (s[k] and 0xFF).toByte()
+            out[k*4+1] = ((s[k] ushr 8) and 0xFF).toByte()
+            out[k*4+2] = ((s[k] ushr 16) and 0xFF).toByte()
+            out[k*4+3] = ((s[k] ushr 24) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    fun chaskeyTag(hexStr: String): String {
+        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return chaskeyTagRaw(bytes).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private fun sha256Block(H: IntArray, W: IntArray) {
@@ -431,7 +489,7 @@ object RsCodersKdf {
             0x983e5152.toInt(),0xa831c66d.toInt(),0xb00327c8.toInt(),0xbf597fc7.toInt(),0xc6e00bf3.toInt(),0xd5a79147.toInt(),0x06ca6351,0x14292967,
             0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e.toInt(),0x92722c85.toInt(),
             0xa2bfe8a1.toInt(),0xa81a664b.toInt(),0xc24b8b70.toInt(),0xc76c51a3.toInt(),0xd192e819.toInt(),0xd6990624.toInt(),0xf40e3585.toInt(),0x106aa070,
-            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4au.toInt(),0x5b9cca4f,0x682e6ff3,
             0x748f82ee,0x78a5636f,0x84c87814.toInt(),0x8cc70208.toInt(),0x90befffa.toInt(),0xa4506ceb.toInt(),0xbef9a3f7.toInt(),0xc67178f2.toInt()
         )
         for (i in 16 until 64) {
@@ -448,7 +506,7 @@ object RsCodersKdf {
         H[0]+=a; H[1]+=b; H[2]+=c; H[3]+=d; H[4]+=e; H[5]+=f; H[6]+=g; H[7]+=h
     }
 
-    private fun sha256Digest(initH: IntArray, data: ByteArray): String {
+    private fun sha256Digest(initH: IntArray, data: ByteArray): ByteArray {
         val H = initH.copyOf()
         val len = data.size; val blen = ((len+8)/64+1)*64
         val buf = ByteArray(blen); data.copyInto(buf); buf[len]=0x80.toByte()
@@ -462,28 +520,39 @@ object RsCodersKdf {
             sha256Block(H,W)
             i+=64
         }
-        return H.joinToString("") { it.u().toString(16).padStart(8,'0') }
+        val out = ByteArray(32)
+        for (k in 0 until 8) {
+            out[k*4+0] = ((H[k] ushr 24) and 0xFF).toByte()
+            out[k*4+1] = ((H[k] ushr 16) and 0xFF).toByte()
+            out[k*4+2] = ((H[k] ushr 8) and 0xFF).toByte()
+            out[k*4+3] = (H[k] and 0xFF).toByte()
+        }
+        return out
+    }
+
+    private fun hmacMacRaw(msg: ByteArray): ByteArray {
+        val inner = sha256Digest(K0, msg)
+        return sha256Digest(K1, inner)
     }
 
     fun hmacMac(msg: String): String {
-        val inner = sha256Digest(K0, msg.toByteArray(Charsets.UTF_8))
-        return sha256Digest(K1, inner.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
+        val result = hmacMacRaw(msg.toByteArray(Charsets.UTF_8))
+        return result.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     fun pipeline(input: ByteArray): ByteArray {
-        val raw = input.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2,'0') }
-        val step1 = siphashTag(input)
-        val step2 = speckEnc(step1)
-        val step3 = chacha20Enc(step2)
-        val kd = K0.joinToString("") { it.u().toString(16).padStart(8,'0') }.let { it.substring(0,32)+it.substring(32,64) }
-        val step4 = poly1305Tag(step3, kd)
-        val step5 = customRcEnc(step4)
-        val step6 = gimliEnc(step5)
-        val step7 = xoodooTag(step6)
-        val step8 = blake3Enc(step7)
-        val step9 = chaskeyTag(step8)
-        val step10 = hmacMac(step9)
-        return step10.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val step1 = siphashRaw(input)
+        val step2 = speckEncRaw(step1)
+        val step3 = chacha20EncRaw(step2)
+        val cc_str = step3.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        val step4 = poly1305TagRaw(cc_str.toByteArray(Charsets.US_ASCII))
+        val step5 = customRcEncRaw(step4)
+        val step6 = gimliEncRaw(step5)
+        val step7 = xoodooTagRaw(step6)
+        val step8 = blake3EncRaw(step7)
+        val step9 = chaskeyTagRaw(step8)
+        val ck_str = step9.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        return hmacMacRaw(ck_str.toByteArray(Charsets.US_ASCII))
     }
 
     fun encrypt(key: ByteArray, plaintext: ByteArray): ByteArray {
