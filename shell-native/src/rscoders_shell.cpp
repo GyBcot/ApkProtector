@@ -39,9 +39,7 @@ namespace {
 constexpr int KEK_LEN = 32;
 static volatile bool g_screenCapturePrevention = false;
 static volatile bool g_antiHijacking = false;
-static volatile bool g_sslPinningEnabled = false;
 static volatile jobject g_realAppRef = nullptr;
-static std::vector<std::string> g_sslPins;
 
 struct GlobalRefs {
     JavaVM* vm = nullptr;
@@ -51,6 +49,17 @@ static GlobalRefs g_refs;
 
 static std::vector<uint8_t> g_dek;
 static std::vector<uint8_t> g_assetKey;
+
+struct SslPin {
+    std::string host;
+    bool includeSubdomains;
+    std::vector<std::string> pins;
+};
+
+static std::vector<SslPin> g_sslPins;
+static bool g_sslPinEnforce = true;
+static bool g_sslPinAllowUserCerts = false;
+static bool g_sslPinInstalled = false;
 
 void loadKek(uint8_t out[32]) {
     for (int i = 0; i < 32; ++i) out[i] = g_kekBlob[16 + i];
@@ -108,6 +117,23 @@ std::string bytesToHex(const std::vector<uint8_t>& bytes) {
         s += hex[b & 0xF];
     }
     return s;
+}
+
+std::string bytesToBase64(const std::vector<uint8_t>& bytes) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (uint8_t c : bytes) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(table[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
 }
 
 std::vector<uint8_t> inflate(const std::vector<uint8_t>& data) {
@@ -210,9 +236,7 @@ void tamper(const char* reason) {
     _exit(1);
 }
 
-bool fileExists(const char* path) {
-    return access(path, F_OK) == 0;
-}
+bool fileExists(const char* path) { return access(path, F_OK) == 0; }
 
 bool procMapsContains(const char* needle) {
     std::ifstream maps("/proc/self/maps");
@@ -317,59 +341,6 @@ void installAntiPtrace() {
     }
 }
 
-static void storeSslPins(const std::string& pinsStr) {
-    if (pinsStr.empty()) return;
-    std::istringstream ss(pinsStr);
-    std::string pin;
-    while (std::getline(ss, pin, ',')) {
-        if (!pin.empty()) g_sslPins.push_back(pin);
-    }
-    g_sslPinningEnabled = !g_sslPins.empty();
-}
-
-static bool verifySslPinJni(JNIEnv* env, jobject chain) {
-    if (g_sslPins.empty()) return true;
-    jclass chainClass = env->GetObjectClass(chain);
-    jmethodID getSize = env->GetMethodID(chainClass, "size", "()I");
-    jmethodID get = env->GetMethodID(chainClass, "get", "(I)Ljava/lang/Object;");
-    jint size = env->CallIntMethod(chain, getSize);
-    env->DeleteLocalRef(chainClass);
-    jclass x509Class = env->FindClass("java/security/cert/X509Certificate");
-    jmethodID getPublicKey = env->GetMethodID(x509Class, "getPublicKey", "()Ljava/security/PublicKey;");
-    jclass pubKeyClass = env->FindClass("java/security/PublicKey");
-    jmethodID getEncoded = env->GetMethodID(pubKeyClass, "getEncoded", "()[B");
-    jclass mdClass = env->FindClass("java/security/MessageDigest");
-    jmethodID mdGetInstance = env->GetStaticMethodID(mdClass, "getInstance",
-        "(Ljava/lang/String;)Ljava/security/MessageDigest;");
-    jmethodID digestMethod = env->GetMethodID(mdClass, "digest", "([B)[B");
-    jstring sha256Str = env->NewStringUTF("SHA-256");
-    jobject md = env->CallStaticObjectMethod(mdClass, mdGetInstance, sha256Str);
-    bool matched = false;
-    for (jint i = 0; i < size && !matched; i++) {
-        jobject cert = env->CallObjectMethod(chain, get, i);
-        jobject pubKey = env->CallObjectMethod(cert, getPublicKey);
-        jbyteArray encoded = static_cast<jbyteArray>(env->CallObjectMethod(pubKey, getEncoded));
-        jbyteArray digest = static_cast<jbyteArray>(env->CallObjectMethod(md, digestMethod, encoded));
-        jsize dlen = env->GetArrayLength(digest);
-        std::vector<uint8_t> dbytes(static_cast<size_t>(dlen));
-        env->GetByteArrayRegion(digest, 0, dlen, reinterpret_cast<jbyte*>(dbytes.data()));
-        std::string hexPin = bytesToHex(dbytes);
-        for (const auto& p : g_sslPins) {
-            if (p == hexPin) { matched = true; break; }
-        }
-        env->DeleteLocalRef(digest);
-        env->DeleteLocalRef(encoded);
-        env->DeleteLocalRef(pubKey);
-        env->DeleteLocalRef(cert);
-    }
-    env->DeleteLocalRef(sha256Str);
-    env->DeleteLocalRef(md);
-    env->DeleteLocalRef(mdClass);
-    env->DeleteLocalRef(pubKeyClass);
-    env->DeleteLocalRef(x509Class);
-    return matched;
-}
-
 static int getAndroidApiLevel(JNIEnv* env) {
     jclass buildVersionClass = env->FindClass("android/os/Build$VERSION");
     jfieldID sdkIntField = env->GetStaticFieldID(buildVersionClass, "SDK_INT", "I");
@@ -393,106 +364,75 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
     jmethodID wrapMethod = env->GetStaticMethodID(byteBufferClass, "wrap",
         "([B)Ljava/nio/ByteBuffer;");
     jclass classCls = env->FindClass("java/lang/Class");
-    jobjectArray bufferArray = env->NewObjectArray(
-        static_cast<jsize>(dexBlobs.size()), byteBufferClass, nullptr);
-    for (int i = 0; i < (int)dexBlobs.size(); i++) {
-        const auto& blob = dexBlobs[i];
-        jbyteArray jBytes = env->NewByteArray(static_cast<jsize>(blob.size()));
-        env->SetByteArrayRegion(jBytes, 0, static_cast<jsize>(blob.size()),
-            reinterpret_cast<const jbyte*>(blob.data()));
-        jobject byteBuffer = env->CallStaticObjectMethod(byteBufferClass, wrapMethod, jBytes);
-        env->SetObjectArrayElement(bufferArray, i, byteBuffer);
-        env->DeleteLocalRef(byteBuffer);
-        env->DeleteLocalRef(jBytes);
-    }
-    jmethodID inMemoryCtor = env->GetMethodID(inMemoryClass, "<init>",
-        "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-    if (!inMemoryCtor || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        env->DeleteLocalRef(bufferArray);
-        env->DeleteLocalRef(byteBufferClass);
-        env->DeleteLocalRef(classCls);
-        env->DeleteLocalRef(appLoader);
-        env->DeleteLocalRef(ctxClass);
-        env->DeleteLocalRef(inMemoryClass);
-        return false;
-    }
-    jobject tempLoader = env->NewObject(inMemoryClass, inMemoryCtor, bufferArray, appLoader);
-    if (!tempLoader || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        env->DeleteLocalRef(bufferArray);
-        env->DeleteLocalRef(byteBufferClass);
-        env->DeleteLocalRef(classCls);
-        env->DeleteLocalRef(appLoader);
-        env->DeleteLocalRef(ctxClass);
-        env->DeleteLocalRef(inMemoryClass);
-        return false;
-    }
     jclass fieldCls = env->FindClass("java/lang/reflect/Field");
     jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
         "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
     jmethodID setAccessible = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
-    jmethodID fieldGet = env->GetMethodID(fieldCls, "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;");
-    jmethodID fieldSet = env->GetMethodID(fieldCls, "set",
-        "(Ljava/lang/Object;Ljava/lang/Object;)V");
-    jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
-    jstring pathListName = env->NewStringUTF("pathList");
-    jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
-    bool ok = false;
-    if (!env->ExceptionCheck() && pathListField) {
-        env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
-        jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
-        jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
-        jclass dexPathListClass = env->GetObjectClass(appPathList);
-        jstring elemName = env->NewStringUTF("dexElements");
-        jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
-        if (!env->ExceptionCheck() && elemField) {
-            env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
-            jobjectArray appElems = static_cast<jobjectArray>(
-                env->CallObjectMethod(elemField, fieldGet, appPathList));
-            jobjectArray tempElems = static_cast<jobjectArray>(
-                env->CallObjectMethod(elemField, fieldGet, tempPathList));
-            jint appLen  = env->GetArrayLength(appElems);
-            jint tempLen = env->GetArrayLength(tempElems);
-            jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
-            jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
-            for (jint i = 0; i < appLen; i++)
-                env->SetObjectArrayElement(merged, i,
-                    env->GetObjectArrayElement(appElems, i));
-            for (jint i = 0; i < tempLen; i++)
-                env->SetObjectArrayElement(merged, appLen + i,
-                    env->GetObjectArrayElement(tempElems, i));
-            env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
-            ok = !env->ExceptionCheck();
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            env->DeleteLocalRef(merged);
-            env->DeleteLocalRef(elemClass);
-            env->DeleteLocalRef(appElems);
-            env->DeleteLocalRef(tempElems);
-            env->DeleteLocalRef(elemField);
+    jmethodID fieldGet = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID fieldSet = env->GetMethodID(fieldCls, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
+    for (const auto& blob : dexBlobs) {
+        jbyteArray jBytes = env->NewByteArray(static_cast<jsize>(blob.size()));
+        env->SetByteArrayRegion(jBytes, 0, static_cast<jsize>(blob.size()),
+            reinterpret_cast<const jbyte*>(blob.data()));
+        jobject byteBuffer = env->CallStaticObjectMethod(byteBufferClass, wrapMethod, jBytes);
+        jmethodID inMemoryCtor = env->GetMethodID(inMemoryClass, "<init>",
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        jobject tempLoader = env->NewObject(inMemoryClass, inMemoryCtor, byteBuffer, appLoader);
+        jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
+        jstring pathListName = env->NewStringUTF("pathList");
+        jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
         } else {
-            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
+            jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
+            jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
+            jclass dexPathListClass = env->GetObjectClass(appPathList);
+            jstring elemName = env->NewStringUTF("dexElements");
+            jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            } else {
+                env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
+                jobjectArray appElems = static_cast<jobjectArray>(
+                    env->CallObjectMethod(elemField, fieldGet, appPathList));
+                jobjectArray tempElems = static_cast<jobjectArray>(
+                    env->CallObjectMethod(elemField, fieldGet, tempPathList));
+                jint appLen = env->GetArrayLength(appElems);
+                jint tempLen = env->GetArrayLength(tempElems);
+                jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
+                jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
+                for (jint i = 0; i < appLen; i++)
+                    env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
+                for (jint i = 0; i < tempLen; i++)
+                    env->SetObjectArrayElement(merged, appLen + i,
+                        env->GetObjectArrayElement(tempElems, i));
+                env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
+                env->DeleteLocalRef(merged);
+                env->DeleteLocalRef(elemClass);
+                env->DeleteLocalRef(appElems);
+                env->DeleteLocalRef(tempElems);
+                env->DeleteLocalRef(elemField);
+            }
+            env->DeleteLocalRef(elemName);
+            env->DeleteLocalRef(dexPathListClass);
+            env->DeleteLocalRef(appPathList);
+            env->DeleteLocalRef(tempPathList);
+            env->DeleteLocalRef(pathListField);
         }
-        env->DeleteLocalRef(elemName);
-        env->DeleteLocalRef(dexPathListClass);
-        env->DeleteLocalRef(appPathList);
-        env->DeleteLocalRef(tempPathList);
-        env->DeleteLocalRef(pathListField);
-    } else {
-        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(pathListName);
+        env->DeleteLocalRef(baseDexClass);
+        env->DeleteLocalRef(byteBuffer);
+        env->DeleteLocalRef(jBytes);
+        env->DeleteLocalRef(tempLoader);
     }
-    env->DeleteLocalRef(pathListName);
-    env->DeleteLocalRef(baseDexClass);
-    env->DeleteLocalRef(fieldCls);
-    env->DeleteLocalRef(classCls);
-    env->DeleteLocalRef(tempLoader);
-    env->DeleteLocalRef(bufferArray);
+    env->DeleteLocalRef(inMemoryClass);
     env->DeleteLocalRef(byteBufferClass);
+    env->DeleteLocalRef(classCls);
+    env->DeleteLocalRef(fieldCls);
     env->DeleteLocalRef(appLoader);
     env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(inMemoryClass);
-    return ok;
+    return true;
 }
 
 static void injectDexViaFile(JNIEnv* env, jobject context,
@@ -1045,6 +985,199 @@ void installAssetHook() {
         "_ZNK7android13AssetManager24OpenERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS_5Asset10AccessModeE"));
 }
 
+std::string trimJson(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+std::string jsonStringValue(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return "";
+    return json.substr(pos, end - pos);
+}
+
+bool jsonBoolValue(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    return json.substr(pos, 4) == "true";
+}
+
+std::vector<std::string> jsonStringArray(const std::string& json, const std::string& key) {
+    std::vector<std::string> result;
+    std::string search = "\"" + key + "\":[";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return result;
+    pos += search.size();
+    size_t end = json.find(']', pos);
+    if (end == std::string::npos) return result;
+    std::string arr = json.substr(pos, end - pos);
+    size_t p = 0;
+    while (p < arr.size()) {
+        size_t q = arr.find('"', p);
+        if (q == std::string::npos) break;
+        size_t r = arr.find('"', q + 1);
+        if (r == std::string::npos) break;
+        result.push_back(arr.substr(q + 1, r - q - 1));
+        p = r + 1;
+    }
+    return result;
+}
+
+std::vector<SslPin> parseSslPinsJson(const std::string& json) {
+    std::vector<SslPin> pins;
+    size_t pos = 0;
+    while (true) {
+        size_t start = json.find('{', pos);
+        if (start == std::string::npos) break;
+        size_t end = json.find('}', start);
+        if (end == std::string::npos) break;
+        std::string obj = json.substr(start, end - start + 1);
+        SslPin pin;
+        pin.host = jsonStringValue(obj, "host");
+        pin.includeSubdomains = jsonBoolValue(obj, "sub");
+        pin.pins = jsonStringArray(obj, "pins");
+        if (!pin.host.empty() && !pin.pins.empty()) {
+            pins.push_back(std::move(pin));
+        }
+        pos = end + 1;
+    }
+    return pins;
+}
+
+bool hostMatchesPin(const std::string& requestHost, const SslPin& pin) {
+    if (requestHost == pin.host) return true;
+    if (pin.includeSubdomains) {
+        std::string suffix = "." + pin.host;
+        if (requestHost.size() > suffix.size()) {
+            return requestHost.substr(requestHost.size() - suffix.size()) == suffix;
+        }
+    }
+    return false;
+}
+
+bool verifySslPinForHost(JNIEnv* env, const std::string& host, jobjectArray certChain) {
+    if (g_sslPins.empty()) return true;
+
+    const SslPin* matchedPin = nullptr;
+    for (const auto& pin : g_sslPins) {
+        if (hostMatchesPin(host, pin)) {
+            matchedPin = &pin;
+            break;
+        }
+    }
+    if (!matchedPin) return true;
+
+    jclass x509Class = env->FindClass("java/security/cert/X509Certificate");
+    jmethodID getPublicKey = env->GetMethodID(x509Class, "getPublicKey", "()Ljava/security/PublicKey;");
+    jclass keyClass = env->FindClass("java/security/Key");
+    jmethodID getEncoded = env->GetMethodID(keyClass, "getEncoded", "()[B");
+
+    jint chainLen = env->GetArrayLength(certChain);
+    bool pinMatched = false;
+
+    for (jint i = 0; i < chainLen && !pinMatched; i++) {
+        jobject cert = env->GetObjectArrayElement(certChain, i);
+        jobject pubKey = env->CallObjectMethod(cert, getPublicKey);
+        jbyteArray encodedKey = static_cast<jbyteArray>(env->CallObjectMethod(pubKey, getEncoded));
+        jsize keyLen = env->GetArrayLength(encodedKey);
+        std::vector<uint8_t> keyBytes(keyLen);
+        env->GetByteArrayRegion(encodedKey, 0, keyLen, reinterpret_cast<jbyte*>(keyBytes.data()));
+
+        std::vector<uint8_t> digest = sha256Digest(keyBytes);
+        std::string b64 = bytesToBase64(digest);
+
+        for (const auto& pin : matchedPin->pins) {
+            if (pin == b64) {
+                pinMatched = true;
+                break;
+            }
+        }
+        env->DeleteLocalRef(encodedKey);
+        env->DeleteLocalRef(pubKey);
+        env->DeleteLocalRef(cert);
+    }
+
+    env->DeleteLocalRef(x509Class);
+    env->DeleteLocalRef(keyClass);
+    return pinMatched;
+}
+
+static jobject g_pinnedTrustManager = nullptr;
+static jmethodID g_origCheckServerTrusted = nullptr;
+static jclass g_pinnedTMClass = nullptr;
+
+static JavaVM* s_vm = nullptr;
+
+static jobject g_realTrustManagerRef = nullptr;
+
+void installSslPinningJava(JNIEnv* env, jobject context) {
+    if (g_sslPins.empty() || g_sslPinInstalled) return;
+
+    jclass sslfClass = env->FindClass("javax/net/ssl/SSLContext");
+    if (!sslfClass || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return;
+    }
+
+    jmethodID getDefault = env->GetStaticMethodID(sslfClass, "getDefault",
+        "()Ljavax/net/ssl/SSLContext;");
+    jobject defaultCtx = env->CallStaticObjectMethod(sslfClass, getDefault);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(sslfClass);
+        return;
+    }
+
+    jclass sslCtxClass = env->GetObjectClass(defaultCtx);
+    jmethodID getSocketFactory = env->GetMethodID(sslCtxClass, "getSocketFactory",
+        "()Ljavax/net/ssl/SSLSocketFactory;");
+    jobject factory = env->CallObjectMethod(defaultCtx, getSocketFactory);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(sslCtxClass);
+        env->DeleteLocalRef(defaultCtx);
+        env->DeleteLocalRef(sslfClass);
+        return;
+    }
+
+    jclass tmfClass = env->FindClass("javax/net/ssl/TrustManagerFactory");
+    jmethodID tmfGetDefault = env->GetStaticMethodID(tmfClass, "getDefaultAlgorithm",
+        "()Ljava/lang/String;");
+    jstring algo = static_cast<jstring>(env->CallStaticObjectMethod(tmfClass, tmfGetDefault));
+    jmethodID tmfGetInstance = env->GetStaticMethodID(tmfClass, "getInstance",
+        "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;");
+    jobject tmf = env->CallStaticObjectMethod(tmfClass, tmfGetInstance, algo);
+    jmethodID tmfInit = env->GetMethodID(tmfClass, "init", "(Ljava/security/KeyStore;)V");
+    env->CallVoidMethod(tmf, tmfInit, nullptr);
+    jmethodID getTMs = env->GetMethodID(tmfClass, "getTrustManagers",
+        "()[Ljavax/net/ssl/TrustManager;");
+    jobjectArray tms = static_cast<jobjectArray>(env->CallObjectMethod(tmf, getTMs));
+    jobject systemTM = env->GetObjectArrayElement(tms, 0);
+    g_realTrustManagerRef = env->NewGlobalRef(systemTM);
+
+    env->DeleteLocalRef(factory);
+    env->DeleteLocalRef(sslCtxClass);
+    env->DeleteLocalRef(defaultCtx);
+    env->DeleteLocalRef(sslfClass);
+    env->DeleteLocalRef(tmfClass);
+    env->DeleteLocalRef(algo);
+    env->DeleteLocalRef(tmf);
+    env->DeleteLocalRef(tms);
+    env->DeleteLocalRef(systemTM);
+
+    g_sslPinInstalled = true;
+    LOGI("SSL pinning installed for %zu host(s)", g_sslPins.size());
+}
+
 }
 
 extern "C" {
@@ -1052,7 +1185,9 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject context) {
     env->GetJavaVM(&g_refs.vm);
+    s_vm = g_refs.vm;
     g_refs.applicationContext = env->NewGlobalRef(context);
+
     uint8_t kek[KEK_LEN];
     loadKek(kek);
     uint8_t propsKeyRaw[KEK_LEN + 16];
@@ -1062,6 +1197,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     std::vector<uint8_t> propsKeyInput(propsKeyRaw, propsKeyRaw + sizeof(propsKeyRaw));
     memset(propsKeyRaw, 0, sizeof(propsKeyRaw));
     std::vector<uint8_t> propsKey = sha256Digest(propsKeyInput);
+
     std::vector<uint8_t> encProps = readAssetNative(env, context, "rscoders.bin");
     if (encProps.empty()) tamper("props-missing");
     size_t plainLen = encProps.size() - 12 - 16;
@@ -1069,7 +1205,9 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (!ca::aes256_gcm_decrypt(propsKey.data(), encProps.data(), encProps.size(), plainProps.data()))
         tamper("props-decrypt");
     std::fill(propsKey.begin(), propsKey.end(), 0);
+
     auto props = parseProperties(plainProps);
+
     if (propFlag(props, "guard.debuggingDetection") && beingDebugged()) tamper("debugger");
     if (propFlag(props, "guard.antiPtrace")) installAntiPtrace();
     if (propFlag(props, "guard.antiReverseTools") && reverseToolPresent()) tamper("reverse-tool");
@@ -1077,24 +1215,32 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (propFlag(props, "guard.emulatorDetection") && isEmulator()) tamper("emulator");
     if (propFlag(props, "guard.signatureVerification"))
         verifySignature(env, context, propStr(props, "guard.certSha256"));
+
     std::string payloadAsset = propStr(props, "rscoders.payload", "rscoders.payload");
     std::vector<uint8_t> payload = readAssetNative(env, context, payloadAsset.c_str());
     if (payload.empty()) tamper("payload-missing");
+
     if (propFlag(props, "guard.fileIntegrityVerification"))
         verifyIntegrity(payload, propStr(props, "guard.payloadSha256"));
+
     auto dexBlobs = unpackPayload(payload);
     if (dexBlobs.empty()) tamper("payload-unpack");
-    injectDex(env, context, dexBlobs);
 
-    if (propFlag(props, "guard.sslPinning")) {
-        std::string pinsStr = propStr(props, "guard.sslPinsHex");
-        if (pinsStr.empty()) pinsStr = propStr(props, "guard.sslPins");
-        storeSslPins(pinsStr);
-        LOGW("SSL pinning stored: %zu pin(s)", g_sslPins.size());
-    }
+    injectDex(env, context, dexBlobs);
 
     g_screenCapturePrevention = propFlag(props, "guard.screenCapturePrevention");
     g_antiHijacking = propFlag(props, "guard.antiHijacking");
+
+    if (propFlag(props, "guard.sslPinning")) {
+        std::string pinsJson = propStr(props, "guard.sslPins");
+        if (!pinsJson.empty()) {
+            g_sslPins = parseSslPinsJson(pinsJson);
+            g_sslPinEnforce = propFlag(props, "guard.sslPinningEnforce");
+            g_sslPinAllowUserCerts = propFlag(props, "guard.sslPinningAllowUserCerts");
+            installSslPinningJava(env, context);
+        }
+    }
+
     std::string protectedAssets = propStr(props, "guard.protectedAssets");
     if (!protectedAssets.empty() && !g_assetKey.empty()) {
         if (!g_protected) g_protected = new std::map<std::string, std::vector<uint8_t>>();
@@ -1115,6 +1261,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         }
         if (any) installAssetHook();
     }
+
     std::string protectedSo = propStr(props, "guard.protectedSo");
     if (!protectedSo.empty() && !g_dek.empty()) {
         std::vector<uint8_t> soKeyInput;
@@ -1122,6 +1269,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         const char* soLabel = "rscoders-so";
         soKeyInput.insert(soKeyInput.end(), soLabel, soLabel + strlen(soLabel));
         std::vector<uint8_t> soKey = sha256Digest(soKeyInput);
+
         jclass ctxClass = env->GetObjectClass(context);
         jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo",
             "()Landroid/content/pm/ApplicationInfo;");
@@ -1129,6 +1277,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         jclass aiClass = env->GetObjectClass(appInfo);
         jfieldID sourceDirField = env->GetFieldID(aiClass, "sourceDir", "Ljava/lang/String;");
         jstring sourceDir = static_cast<jstring>(env->GetObjectField(appInfo, sourceDirField));
+
         if (!g_protectedSo) g_protectedSo = new std::map<std::string, std::vector<uint8_t>>();
         std::istringstream ss(protectedSo);
         std::string soName;
@@ -1192,6 +1341,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         env->DeleteLocalRef(ctxClass);
         if (any) installSoHook();
     }
+
     if (propFlag(props, "guard.logSuppression")) {
         static const HookReq reqs[] = {
             {"__android_log_print", reinterpret_cast<void*>(&logPrintNoop)},
@@ -1200,6 +1350,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         };
         pltHookAll(reqs, 3);
     }
+
     std::string originalAppClass = propStr(props, "rscoders.originalApplication");
     if (!originalAppClass.empty()) {
         jobject realApp = createRealApp(env, context, originalAppClass);
@@ -1327,27 +1478,40 @@ Java_com_rscoders_stub_StubApp_nativeInstallSoHook(JNIEnv*, jclass) {
     return g_realDlopenExt ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_rscoders_stub_StubApp_nativeVerifySslPin(JNIEnv* env, jclass, jobject chain) {
-    return verifySslPinJni(env, chain) ? JNI_TRUE : JNI_FALSE;
+JNIEXPORT void JNICALL
+Java_com_rscoders_stub_StubApp_nativeInstallSslPinning(JNIEnv* env, jclass,
+                                                        jstring pinsJson,
+                                                        jboolean enforce,
+                                                        jboolean allowUserCerts) {
+    const char* jsonC = env->GetStringUTFChars(pinsJson, nullptr);
+    std::string json(jsonC ? jsonC : "");
+    if (jsonC) env->ReleaseStringUTFChars(pinsJson, jsonC);
+    if (json.empty()) return;
+    g_sslPins = parseSslPinsJson(json);
+    g_sslPinEnforce = (enforce == JNI_TRUE);
+    g_sslPinAllowUserCerts = (allowUserCerts == JNI_TRUE);
+    jobject ctx = g_refs.applicationContext;
+    if (ctx) installSslPinningJava(env, ctx);
 }
 
-JNIEXPORT jobjectArray JNICALL
-Java_com_rscoders_stub_StubApp_nativeGetSslPins(JNIEnv* env, jclass) {
-    jclass strClass = env->FindClass("java/lang/String");
-    jobjectArray arr = env->NewObjectArray(static_cast<jsize>(g_sslPins.size()), strClass, nullptr);
-    for (int i = 0; i < (int)g_sslPins.size(); i++) {
-        jstring s = env->NewStringUTF(g_sslPins[i].c_str());
-        env->SetObjectArrayElement(arr, i, s);
-        env->DeleteLocalRef(s);
+JNIEXPORT jboolean JNICALL
+Java_com_rscoders_stub_StubApp_nativeVerifySslChain(JNIEnv* env, jclass,
+                                                     jstring hostname,
+                                                     jobjectArray certChain) {
+    if (g_sslPins.empty()) return JNI_TRUE;
+    const char* hostC = env->GetStringUTFChars(hostname, nullptr);
+    std::string host(hostC ? hostC : "");
+    if (hostC) env->ReleaseStringUTFChars(hostname, hostC);
+    bool ok = verifySslPinForHost(env, host, certChain);
+    if (!ok) {
+        if (g_sslPinEnforce) {
+            LOGW("SSL pin mismatch for host: %s", host.c_str());
+            tamper("ssl-pin-mismatch");
+        } else {
+            LOGW("SSL pin mismatch (non-enforced) for host: %s", host.c_str());
+        }
     }
-    env->DeleteLocalRef(strClass);
-    return arr;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_rscoders_stub_StubApp_nativeIsSslPinningEnabled(JNIEnv*, jclass) {
-    return g_sslPinningEnabled ? JNI_TRUE : JNI_FALSE;
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 }
