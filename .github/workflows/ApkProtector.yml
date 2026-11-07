@@ -7,6 +7,14 @@ on:
         description: 'Release tag source apk (kosongkan untuk ambil terbaru)'
         required: false
         default: ''
+      ssl_pins:
+        description: 'SSL pins (format: hostname:sha256base64, pisah koma, * prefix untuk subdomains)'
+        required: false
+        default: ''
+      ssl_pin_enforce:
+        description: 'Enforce SSL pinning (kill jika gagal)'
+        required: false
+        default: 'true'
 
 permissions:
   actions: write
@@ -93,13 +101,31 @@ jobs:
           chmod +x gradlew
           ./gradlew :packer-cli:installDist
 
+      - name: Build SSL Pin Args
+        id: sslargs
+        run: |
+          SSL_PINS="${{ github.event.inputs.ssl_pins }}"
+          SSL_ENFORCE="${{ github.event.inputs.ssl_pin_enforce }}"
+          ARGS=""
+          if [ -n "$SSL_PINS" ]; then
+            IFS=',' read -ra PINS <<< "$SSL_PINS"
+            for PIN in "${PINS[@]}"; do
+              PIN=$(echo "$PIN" | xargs)
+              [ -n "$PIN" ] && ARGS="$ARGS --ssl-pin \"$PIN\""
+            done
+          fi
+          if [ "$SSL_ENFORCE" = "false" ]; then
+            ARGS="$ARGS --no-ssl-pin-enforce"
+          fi
+          echo "ssl_args=$ARGS" >> $GITHUB_OUTPUT
+
       - name: Harden APK with ApkProtector
         id: harden
         run: |
           APK_BASENAME=$(basename "${{ steps.release.outputs.apk_name }}" .apk)
           HARDENED_NAME="${APK_BASENAME}_protected.apk"
           mkdir -p hardened
-          ApkProtector/packer-cli/build/install/rscoders/bin/rscoders \
+          eval ApkProtector/packer-cli/build/install/rscoders/bin/rscoders \
             -i "input/${{ steps.release.outputs.apk_name }}" \
             -o "hardened/${HARDENED_NAME}" \
             --stub-dex ApkProtector/shell-stub/build/classes.dex \
@@ -110,8 +136,7 @@ jobs:
             --ks-alias rscoders \
             --protection default \
             --no-secure-screen \
-            --ssl-pinning \
-            --ssl-pin ${{ secrets.SSL_PIN_1 }}
+            ${{ steps.sslargs.outputs.ssl_args }}
           echo "hardened_path=hardened/${HARDENED_NAME}" >> $GITHUB_OUTPUT
           echo "hardened_name=${HARDENED_NAME}" >> $GITHUB_OUTPUT
 
