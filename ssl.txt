@@ -1,0 +1,1 @@
+openssl s_client -connect tokovpn.com:443 -showcerts 2>/dev/null |   awk '/-----BEGIN CERTIFICATE-----/{c++} c==2{print} /-----END CERTIFICATE-----/ && c==2{exit}' |   openssl x509 -pubkey -noout |   openssl pkey -pubin -outform DER |   openssl dgst -sha256 -hex |   awk '{print $2}'
