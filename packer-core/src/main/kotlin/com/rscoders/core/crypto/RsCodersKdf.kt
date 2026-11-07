@@ -114,7 +114,11 @@ object RsCodersKdf {
         }
         val ks = sched.take(27)
         val w = mutableListOf<Int>()
-        for (i in 0 until 16 step 2) w.add(hexStr.substring(i*2, i*2+8).toLong(16).toInt())
+        var i = 0
+        while (i + 8 <= hexStr.length) {
+            w.add(hexStr.substring(i, i+8).toLong(16).toInt())
+            i += 8
+        }
         var x = w.getOrElse(0){0}; var y = w.getOrElse(1){0}
         for (k in ks) { val r=speckRound(x,y,k); x=r.first; y=r.second }
         return x.u().toString(16).padStart(8,'0') + y.u().toString(16).padStart(8,'0')
