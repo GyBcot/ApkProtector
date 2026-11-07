@@ -106,6 +106,7 @@ class HardeningPipeline(
                 appendLine("guard.logSuppression=${p.logSuppression}")
                 appendLine("guard.sslPinning=${p.sslPinning && sslPinsValue.isNotEmpty()}")
                 appendLine("guard.sslPins=$sslPinsValue")
+                appendLine("guard.sslPinsHex=$sslPinsValue")
                 appendLine("guard.protectedAssets=${protectedNames.joinToString(",")}")
                 appendLine("guard.protectedSo=${soNames.joinToString(",")}")
             }.toByteArray()
