@@ -7,6 +7,7 @@ import com.rscoders.core.crypto.ShellPatcher
 import com.rscoders.core.sign.ApkSignerTool
 import com.rscoders.core.sign.CertFingerprint
 import com.rscoders.core.steps.ApkRepackager
+import com.rscoders.core.steps.NscBuilder
 import java.io.File
 import java.nio.file.Files
 import java.security.MessageDigest
@@ -69,15 +70,34 @@ class HardeningPipeline(
                 }
             }
 
-            val patched = BinaryXml.setApplicationName(manifestBytes, config.stubApplicationClass)
+            val ssl = config.protection.sslPinning
+            val nscBytes: ByteArray?
+            val nscResId: Int
+            if (ssl.enabled && ssl.pins.isNotEmpty()) {
+                nscBytes = NscBuilder.build(ssl)
+                nscResId = 0x7F0F0001
+                steps += StepReport(
+                    "nsc-inject",
+                    "${ssl.pins.size} host(s) pinned via NetworkSecurityConfig, enforce=${ssl.enforcePinning}",
+                )
+            } else {
+                nscBytes = null
+                nscResId = 0
+            }
+
+            val patched = BinaryXml.setApplicationName(
+                manifestBytes,
+                config.stubApplicationClass,
+                nscResId.takeIf { nscBytes != null },
+            )
             steps += StepReport(
                 "patch-manifest",
                 "application -> ${config.stubApplicationClass} " +
-                    "(was ${patched.originalApplicationClass ?: "<default>"})",
+                    "(was ${patched.originalApplicationClass ?: "<default>"})" +
+                    if (nscBytes != null) " + networkSecurityConfig" else "",
             )
 
             val p = config.protection
-            val ssl = p.sslPinning
             val fingerprint = UUID.randomUUID().toString()
             val payloadSha = CertFingerprint.sha256Hex(payload)
             val propsBytes = buildString {
@@ -122,13 +142,6 @@ class HardeningPipeline(
                 }
             }.toByteArray()
 
-            if (ssl.enabled && ssl.pins.isNotEmpty()) {
-                steps += StepReport(
-                    "ssl-pinning",
-                    "${ssl.pins.size} host(s) pinned, enforce=${ssl.enforcePinning}",
-                )
-            }
-
             steps += StepReport(
                 "guard",
                 "fingerprint=${fingerprint.take(8)}… " +
@@ -147,6 +160,9 @@ class HardeningPipeline(
                 put("assets/rscoders.payload", payload)
                 put("assets/rscoders.bin", encryptedProps)
                 putAll(encAssets)
+                if (nscBytes != null) {
+                    put("res/xml/rscoders_nsc.xml", nscBytes)
+                }
             }
             val stored = config.nativeShells.mapKeys { (abi, _) -> "lib/$abi/librscoders.so" }
                 .mapValues { (_, so) -> ShellPatcher.patch(so.readBytes(), kek) } +
@@ -161,6 +177,7 @@ class HardeningPipeline(
                 storedEntries = stored,
                 deflatedEntries = deflated,
                 skipEntries = assetSkip,
+                skipNscEntry = nscBytes != null,
             )
             steps += StepReport(
                 "repackage",
