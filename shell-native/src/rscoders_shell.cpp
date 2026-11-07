@@ -25,17 +25,15 @@
 #include "ca_crypto.h"
 
 #define LOG_TAG "RSCoders"
-
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 __attribute__((used, aligned(16)))
-
 volatile uint8_t g_kekBlob[48] = {
     0xCA, 0x1B, 0x0B, 0x1E, 0x5E, 0xC0, 0xDE, 0x4B, 0x45, 0x4B, 0x21, 0x76, 0x31, 0x00, 0xA5, 0x5A,
     0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,
-    0x0F,0x1E,0x2D,0x3C,0x4B,0x5A,0x69,0x78,0x87,0x96,0xA5,0xB4,0xC3,0xD2,0xE1,0xF0};
+    0x0F,0x1E,0x2D,0x3C,0x4B,0x5A,0x69,0x78,0x87,0x96,0xA5,0xB4,0xC3,0xD2,0xE1,0xF0
+};
 
 namespace {
 
@@ -55,6 +53,23 @@ static std::vector<uint8_t> g_assetKey;
 
 void loadKek(uint8_t out[32]) {
     for (int i = 0; i < 32; ++i) out[i] = g_kekBlob[16 + i];
+}
+
+static bool rs_pipeline_decrypt(const uint8_t *key, size_t keylen, const uint8_t *ct, size_t ctlen, std::vector<uint8_t> &out) {
+    if (ctlen < 4) return false;
+    out.resize(ctlen);
+    size_t outlen = 0;
+    if (!ca::rs_decrypt(key, keylen, ct, ctlen, out.data(), &outlen)) return false;
+    out.resize(outlen);
+    return true;
+}
+
+static bool rs_pipeline_encrypt(const uint8_t *key, size_t keylen, const uint8_t *plain, size_t plainlen, std::vector<uint8_t> &out) {
+    out.resize(plainlen + 4);
+    size_t outlen = 0;
+    if (!ca::rs_encrypt(key, keylen, plain, plainlen, out.data(), &outlen)) return false;
+    out.resize(outlen);
+    return true;
 }
 
 std::vector<uint8_t> readAssetNative(JNIEnv* env, jobject context, const char* name) {
@@ -86,8 +101,7 @@ std::vector<uint8_t> sha256Digest(const std::vector<uint8_t>& data) {
     jobject md = env->CallStaticObjectMethod(mdClass, getInstance, algo);
     jmethodID digestMethod = env->GetMethodID(mdClass, "digest", "([B)[B");
     jbyteArray input = env->NewByteArray(static_cast<jsize>(data.size()));
-    env->SetByteArrayRegion(input, 0, static_cast<jsize>(data.size()),
-        reinterpret_cast<const jbyte*>(data.data()));
+    env->SetByteArrayRegion(input, 0, static_cast<jsize>(data.size()), reinterpret_cast<const jbyte*>(data.data()));
     jbyteArray result = static_cast<jbyteArray>(env->CallObjectMethod(md, digestMethod, input));
     jsize rlen = env->GetArrayLength(result);
     std::vector<uint8_t> out(rlen);
@@ -104,10 +118,7 @@ std::string bytesToHex(const std::vector<uint8_t>& bytes) {
     static const char hex[] = "0123456789abcdef";
     std::string s;
     s.reserve(bytes.size() * 2);
-    for (uint8_t b : bytes) {
-        s += hex[b >> 4];
-        s += hex[b & 0xF];
-    }
+    for (uint8_t b : bytes) { s += hex[b >> 4]; s += hex[b & 0xF]; }
     return s;
 }
 
@@ -154,9 +165,9 @@ std::vector<std::vector<uint8_t>> unpackPayload(const std::vector<uint8_t>& payl
 
     uint8_t kek[KEK_LEN];
     loadKek(kek);
-    size_t dekOutLen = wrappedDek.size() - 12 - 16;
-    std::vector<uint8_t> dek(dekOutLen);
-    if (!ca::aes256_gcm_decrypt(kek, wrappedDek.data(), wrappedDek.size(), dek.data())) {
+
+    std::vector<uint8_t> dek;
+    if (!rs_pipeline_decrypt(kek, KEK_LEN, wrappedDek.data(), wrappedDek.size(), dek)) {
         memset(kek, 0, sizeof(kek));
         return {};
     }
@@ -170,9 +181,8 @@ std::vector<std::vector<uint8_t>> unpackPayload(const std::vector<uint8_t>& payl
     combined.insert(combined.end(), assetLabel, assetLabel + strlen(assetLabel));
     g_assetKey = sha256Digest(combined);
 
-    size_t bodyOutLen = body.size() - 12 - 16;
-    std::vector<uint8_t> bodyDec(bodyOutLen);
-    if (!ca::aes256_gcm_decrypt(dek.data(), body.data(), body.size(), bodyDec.data())) return {};
+    std::vector<uint8_t> bodyDec;
+    if (!rs_pipeline_decrypt(dek.data(), dek.size(), body.data(), body.size(), bodyDec)) return {};
 
     std::vector<uint8_t> container = inflate(bodyDec);
     if (container.size() < 8 || memcmp(container.data(), "CADX", 4) != 0) return {};
@@ -209,8 +219,7 @@ bool propFlag(const std::map<std::string, std::string>& props, const std::string
     return it->second == "true";
 }
 
-std::string propStr(const std::map<std::string, std::string>& props,
-                    const std::string& key, const std::string& def = "") {
+std::string propStr(const std::map<std::string, std::string>& props, const std::string& key, const std::string& def = "") {
     auto it = props.find(key);
     return (it != props.end()) ? it->second : def;
 }
@@ -221,16 +230,12 @@ void tamper(const char* reason) {
     _exit(1);
 }
 
-bool fileExists(const char* path) {
-    return access(path, F_OK) == 0;
-}
+bool fileExists(const char* path) { return access(path, F_OK) == 0; }
 
 bool procMapsContains(const char* needle) {
     std::ifstream maps("/proc/self/maps");
     std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find(needle) != std::string::npos) return true;
-    }
+    while (std::getline(maps, line)) if (line.find(needle) != std::string::npos) return true;
     return false;
 }
 
@@ -244,9 +249,7 @@ bool tracerPidNonZero() {
     std::ifstream status("/proc/self/status");
     std::string line;
     while (std::getline(status, line)) {
-        if (line.rfind("TracerPid:", 0) == 0) {
-            return std::atoi(line.c_str() + 10) != 0;
-        }
+        if (line.rfind("TracerPid:", 0) == 0) return std::atoi(line.c_str() + 10) != 0;
     }
     return false;
 }
@@ -265,9 +268,7 @@ bool isRooted() {
     if (tags.find("test-keys") != std::string::npos) return true;
     std::ifstream mounts("/proc/self/mounts");
     std::string line;
-    while (std::getline(mounts, line)) {
-        if (line.find("magisk") != std::string::npos) return true;
-    }
+    while (std::getline(mounts, line)) if (line.find("magisk") != std::string::npos) return true;
     return false;
 }
 
@@ -323,9 +324,7 @@ void* antiPtracePoller(void*) {
 void installAntiPtrace() {
     prctl(PR_SET_DUMPABLE, 0);
     pthread_t t;
-    if (pthread_create(&t, nullptr, antiPtracePoller, nullptr) == 0) {
-        pthread_detach(t);
-    }
+    if (pthread_create(&t, nullptr, antiPtracePoller, nullptr) == 0) pthread_detach(t);
 }
 
 static int getAndroidApiLevel(JNIEnv* env) {
@@ -336,114 +335,79 @@ static int getAndroidApiLevel(JNIEnv* env) {
     return static_cast<int>(apiLevel);
 }
 
-static bool injectDexInMemory(JNIEnv* env, jobject context,
-                               const std::vector<std::vector<uint8_t>>& dexBlobs) {
+static bool injectDexInMemory(JNIEnv* env, jobject context, const std::vector<std::vector<uint8_t>>& dexBlobs) {
     jclass inMemoryClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-    if (!inMemoryClass || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        return false;
-    }
+    if (!inMemoryClass || env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader",
-        "()Ljava/lang/ClassLoader;");
+    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
     jobject appLoader = env->CallObjectMethod(context, getClassLoader);
     jclass byteBufferClass = env->FindClass("java/nio/ByteBuffer");
-    jmethodID wrapMethod = env->GetStaticMethodID(byteBufferClass, "wrap",
-        "([B)Ljava/nio/ByteBuffer;");
+    jmethodID wrapMethod = env->GetStaticMethodID(byteBufferClass, "wrap", "([B)Ljava/nio/ByteBuffer;");
     jclass classCls = env->FindClass("java/lang/Class");
     jclass fieldCls = env->FindClass("java/lang/reflect/Field");
-    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
+    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
     jmethodID setAccessible = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
     jmethodID fieldGet = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
     jmethodID fieldSet = env->GetMethodID(fieldCls, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
     for (const auto& blob : dexBlobs) {
         jbyteArray jBytes = env->NewByteArray(static_cast<jsize>(blob.size()));
-        env->SetByteArrayRegion(jBytes, 0, static_cast<jsize>(blob.size()),
-            reinterpret_cast<const jbyte*>(blob.data()));
+        env->SetByteArrayRegion(jBytes, 0, static_cast<jsize>(blob.size()), reinterpret_cast<const jbyte*>(blob.data()));
         jobject byteBuffer = env->CallStaticObjectMethod(byteBufferClass, wrapMethod, jBytes);
-        jmethodID inMemoryCtor = env->GetMethodID(inMemoryClass, "<init>",
-            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        jmethodID inMemoryCtor = env->GetMethodID(inMemoryClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
         jobject tempLoader = env->NewObject(inMemoryClass, inMemoryCtor, byteBuffer, appLoader);
         jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
         jstring pathListName = env->NewStringUTF("pathList");
         jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-        } else {
+        if (env->ExceptionCheck()) { env->ExceptionClear(); } else {
             env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
             jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
             jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
             jclass dexPathListClass = env->GetObjectClass(appPathList);
             jstring elemName = env->NewStringUTF("dexElements");
             jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-            } else {
+            if (env->ExceptionCheck()) { env->ExceptionClear(); } else {
                 env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
-                jobjectArray appElems = static_cast<jobjectArray>(
-                    env->CallObjectMethod(elemField, fieldGet, appPathList));
-                jobjectArray tempElems = static_cast<jobjectArray>(
-                    env->CallObjectMethod(elemField, fieldGet, tempPathList));
+                jobjectArray appElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, appPathList));
+                jobjectArray tempElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, tempPathList));
                 jint appLen = env->GetArrayLength(appElems);
                 jint tempLen = env->GetArrayLength(tempElems);
                 jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
                 jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
-                for (jint i = 0; i < appLen; i++)
-                    env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
-                for (jint i = 0; i < tempLen; i++)
-                    env->SetObjectArrayElement(merged, appLen + i,
-                        env->GetObjectArrayElement(tempElems, i));
+                for (jint i = 0; i < appLen; i++) env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
+                for (jint i = 0; i < tempLen; i++) env->SetObjectArrayElement(merged, appLen + i, env->GetObjectArrayElement(tempElems, i));
                 env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
-                env->DeleteLocalRef(merged);
-                env->DeleteLocalRef(elemClass);
-                env->DeleteLocalRef(appElems);
-                env->DeleteLocalRef(tempElems);
-                env->DeleteLocalRef(elemField);
+                env->DeleteLocalRef(merged); env->DeleteLocalRef(elemClass);
+                env->DeleteLocalRef(appElems); env->DeleteLocalRef(tempElems); env->DeleteLocalRef(elemField);
             }
-            env->DeleteLocalRef(elemName);
-            env->DeleteLocalRef(dexPathListClass);
-            env->DeleteLocalRef(appPathList);
-            env->DeleteLocalRef(tempPathList);
-            env->DeleteLocalRef(pathListField);
+            env->DeleteLocalRef(elemName); env->DeleteLocalRef(dexPathListClass);
+            env->DeleteLocalRef(appPathList); env->DeleteLocalRef(tempPathList); env->DeleteLocalRef(pathListField);
         }
-        env->DeleteLocalRef(pathListName);
-        env->DeleteLocalRef(baseDexClass);
-        env->DeleteLocalRef(byteBuffer);
-        env->DeleteLocalRef(jBytes);
-        env->DeleteLocalRef(tempLoader);
+        env->DeleteLocalRef(pathListName); env->DeleteLocalRef(baseDexClass);
+        env->DeleteLocalRef(byteBuffer); env->DeleteLocalRef(jBytes); env->DeleteLocalRef(tempLoader);
     }
-    env->DeleteLocalRef(inMemoryClass);
-    env->DeleteLocalRef(byteBufferClass);
-    env->DeleteLocalRef(classCls);
-    env->DeleteLocalRef(fieldCls);
-    env->DeleteLocalRef(appLoader);
-    env->DeleteLocalRef(ctxClass);
+    env->DeleteLocalRef(inMemoryClass); env->DeleteLocalRef(byteBufferClass);
+    env->DeleteLocalRef(classCls); env->DeleteLocalRef(fieldCls);
+    env->DeleteLocalRef(appLoader); env->DeleteLocalRef(ctxClass);
     return true;
 }
 
-static void injectDexViaFile(JNIEnv* env, jobject context,
-                              const std::vector<std::vector<uint8_t>>& dexBlobs) {
+static void injectDexViaFile(JNIEnv* env, jobject context, const std::vector<std::vector<uint8_t>>& dexBlobs) {
     jclass ctxClass = env->GetObjectClass(context);
     jclass fileClass = env->FindClass("java/io/File");
     jclass classCls = env->FindClass("java/lang/Class");
     jclass fieldCls = env->FindClass("java/lang/reflect/Field");
-
     jmethodID getCacheDir = env->GetMethodID(ctxClass, "getCacheDir", "()Ljava/io/File;");
     jmethodID getAbsPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
     jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
-    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
+    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
     jmethodID setAccessible = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
     jmethodID fieldGet = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
     jmethodID fieldSet = env->GetMethodID(fieldCls, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
-
     jobject cacheDir = env->CallObjectMethod(context, getCacheDir);
     jstring jCachePath = static_cast<jstring>(env->CallObjectMethod(cacheDir, getAbsPath));
     const char* cacheChars = env->GetStringUTFChars(jCachePath, nullptr);
     std::string cacheDirStr(cacheChars);
     env->ReleaseStringUTFChars(jCachePath, cacheChars);
-
     std::string dexPath;
     std::vector<std::string> tempFiles;
     for (int i = 0; i < (int)dexBlobs.size(); i++) {
@@ -454,82 +418,56 @@ static void injectDexViaFile(JNIEnv* env, jobject context,
         dexPath += path;
         tempFiles.push_back(path);
     }
-
     jobject appLoader = env->CallObjectMethod(context, getClassLoader);
-
     jclass dexLoaderClass = env->FindClass("dalvik/system/DexClassLoader");
-    jmethodID dexLoaderCtor = env->GetMethodID(dexLoaderClass, "<init>",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+    jmethodID dexLoaderCtor = env->GetMethodID(dexLoaderClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
     jstring jDexPath = env->NewStringUTF(dexPath.c_str());
     jstring jOptDir = env->NewStringUTF(cacheDirStr.c_str());
-    jobject tempLoader = env->NewObject(dexLoaderClass, dexLoaderCtor,
-        jDexPath, jOptDir, nullptr, appLoader);
-    env->DeleteLocalRef(jDexPath);
-    env->DeleteLocalRef(jOptDir);
-
+    jobject tempLoader = env->NewObject(dexLoaderClass, dexLoaderCtor, jDexPath, jOptDir, nullptr, appLoader);
+    env->DeleteLocalRef(jDexPath); env->DeleteLocalRef(jOptDir);
     jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
     jstring pathListName = env->NewStringUTF("pathList");
     jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
     env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
     env->DeleteLocalRef(pathListName);
-
     jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
     jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
     env->DeleteLocalRef(pathListField);
-
     jclass dexPathListClass = env->GetObjectClass(appPathList);
     jstring elemName = env->NewStringUTF("dexElements");
     jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
     env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
     env->DeleteLocalRef(elemName);
-
     jobjectArray appElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, appPathList));
     jobjectArray tempElems = static_cast<jobjectArray>(env->CallObjectMethod(elemField, fieldGet, tempPathList));
-
     jint appLen = env->GetArrayLength(appElems);
     jint tempLen = env->GetArrayLength(tempElems);
     jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
     jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
-    for (jint i = 0; i < appLen; i++)
-        env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
-    for (jint i = 0; i < tempLen; i++)
-        env->SetObjectArrayElement(merged, appLen + i, env->GetObjectArrayElement(tempElems, i));
+    for (jint i = 0; i < appLen; i++) env->SetObjectArrayElement(merged, i, env->GetObjectArrayElement(appElems, i));
+    for (jint i = 0; i < tempLen; i++) env->SetObjectArrayElement(merged, appLen + i, env->GetObjectArrayElement(tempElems, i));
     env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
-
     for (auto& p : tempFiles) remove(p.c_str());
-
-    env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(fileClass);
-    env->DeleteLocalRef(classCls);
-    env->DeleteLocalRef(fieldCls);
-    env->DeleteLocalRef(cacheDir);
-    env->DeleteLocalRef(jCachePath);
-    env->DeleteLocalRef(appLoader);
-    env->DeleteLocalRef(dexLoaderClass);
-    env->DeleteLocalRef(tempLoader);
-    env->DeleteLocalRef(baseDexClass);
-    env->DeleteLocalRef(appPathList);
-    env->DeleteLocalRef(tempPathList);
-    env->DeleteLocalRef(dexPathListClass);
-    env->DeleteLocalRef(elemField);
-    env->DeleteLocalRef(appElems);
-    env->DeleteLocalRef(tempElems);
-    env->DeleteLocalRef(elemClass);
-    env->DeleteLocalRef(merged);
+    env->DeleteLocalRef(ctxClass); env->DeleteLocalRef(fileClass);
+    env->DeleteLocalRef(classCls); env->DeleteLocalRef(fieldCls);
+    env->DeleteLocalRef(cacheDir); env->DeleteLocalRef(jCachePath);
+    env->DeleteLocalRef(appLoader); env->DeleteLocalRef(dexLoaderClass);
+    env->DeleteLocalRef(tempLoader); env->DeleteLocalRef(baseDexClass);
+    env->DeleteLocalRef(appPathList); env->DeleteLocalRef(tempPathList);
+    env->DeleteLocalRef(dexPathListClass); env->DeleteLocalRef(elemField);
+    env->DeleteLocalRef(appElems); env->DeleteLocalRef(tempElems);
+    env->DeleteLocalRef(elemClass); env->DeleteLocalRef(merged);
 }
 
 void injectDex(JNIEnv* env, jobject context, const std::vector<std::vector<uint8_t>>& dexBlobs) {
     int apiLevel = getAndroidApiLevel(env);
-    if (apiLevel >= 26) {
-        if (injectDexInMemory(env, context, dexBlobs)) return;
-    }
+    if (apiLevel >= 26) { if (injectDexInMemory(env, context, dexBlobs)) return; }
     injectDexViaFile(env, context, dexBlobs);
 }
 
 jobject findField(JNIEnv* env, jclass cls, const char* name) {
     jclass classClass = env->FindClass("java/lang/Class");
-    jmethodID getDeclaredField = env->GetMethodID(classClass, "getDeclaredField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
+    jmethodID getDeclaredField = env->GetMethodID(classClass, "getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
     jstring jname = env->NewStringUTF(name);
     jobject field = nullptr;
     jclass c = static_cast<jclass>(env->NewLocalRef(cls));
@@ -538,17 +476,13 @@ jobject findField(JNIEnv* env, jclass cls, const char* name) {
         field = env->CallObjectMethod(c, getDeclaredField, jname);
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
-            jmethodID getSuperclass = env->GetMethodID(classClass, "getSuperclass",
-                "()Ljava/lang/Class;");
+            jmethodID getSuperclass = env->GetMethodID(classClass, "getSuperclass", "()Ljava/lang/Class;");
             jclass parent = static_cast<jclass>(env->CallObjectMethod(c, getSuperclass));
-            env->DeleteLocalRef(c);
-            c = parent;
-            field = nullptr;
+            env->DeleteLocalRef(c); c = parent; field = nullptr;
         }
     }
     if (c) env->DeleteLocalRef(c);
-    env->DeleteLocalRef(jname);
-    env->DeleteLocalRef(classClass);
+    env->DeleteLocalRef(jname); env->DeleteLocalRef(classClass);
     return field;
 }
 
@@ -559,8 +493,7 @@ jobject getFieldValue(JNIEnv* env, jobject field, jobject obj) {
     jclass fClass = env->FindClass("java/lang/reflect/Field");
     jmethodID get = env->GetMethodID(fClass, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
     jobject result = env->CallObjectMethod(field, get, obj);
-    env->DeleteLocalRef(fieldClass);
-    env->DeleteLocalRef(fClass);
+    env->DeleteLocalRef(fieldClass); env->DeleteLocalRef(fClass);
     return result;
 }
 
@@ -571,38 +504,30 @@ void setFieldValue(JNIEnv* env, jobject field, jobject obj, jobject value) {
     jclass fClass = env->FindClass("java/lang/reflect/Field");
     jmethodID set = env->GetMethodID(fClass, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
     env->CallVoidMethod(field, set, obj, value);
-    env->DeleteLocalRef(fieldClass);
-    env->DeleteLocalRef(fClass);
+    env->DeleteLocalRef(fieldClass); env->DeleteLocalRef(fClass);
 }
 
 jobject createRealApp(JNIEnv* env, jobject context, const std::string& className) {
     jclass classLoaderClass = env->FindClass("java/lang/ClassLoader");
     jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader",
-        "()Ljava/lang/ClassLoader;");
+    jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
     jobject classLoader = env->CallObjectMethod(context, getClassLoader);
-    jmethodID loadClass = env->GetMethodID(classLoaderClass, "loadClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;");
+    jmethodID loadClass = env->GetMethodID(classLoaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
     jstring jclassName = env->NewStringUTF(className.c_str());
-    jclass realClass = static_cast<jclass>(
-        env->CallObjectMethod(classLoader, loadClass, jclassName));
+    jclass realClass = static_cast<jclass>(env->CallObjectMethod(classLoader, loadClass, jclassName));
     if (!realClass || env->ExceptionCheck()) {
         env->ExceptionClear();
-        env->DeleteLocalRef(jclassName);
-        env->DeleteLocalRef(classLoader);
-        env->DeleteLocalRef(ctxClass);
-        env->DeleteLocalRef(classLoaderClass);
+        env->DeleteLocalRef(jclassName); env->DeleteLocalRef(classLoader);
+        env->DeleteLocalRef(ctxClass); env->DeleteLocalRef(classLoaderClass);
         return nullptr;
     }
     jmethodID ctor = env->GetMethodID(realClass, "<init>", "()V");
     jobject app = env->NewObject(realClass, ctor);
-
     jclass appCls = env->FindClass("android/app/Application");
     jclass classCls = env->FindClass("java/lang/Class");
     jclass accessCls = env->FindClass("java/lang/reflect/AccessibleObject");
     jmethodID setAcc = env->GetMethodID(accessCls, "setAccessible", "(Z)V");
-    jmethodID getDeclMethod = env->GetMethodID(classCls, "getDeclaredMethod",
-        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;");
+    jmethodID getDeclMethod = env->GetMethodID(classCls, "getDeclaredMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;");
     jstring attachName = env->NewStringUTF("attach");
     jclass contextClass = env->FindClass("android/content/Context");
     jobjectArray paramTypes = env->NewObjectArray(1, classCls, contextClass);
@@ -610,37 +535,23 @@ jobject createRealApp(JNIEnv* env, jobject context, const std::string& className
     jobject attachMethodObj = env->CallObjectMethod(appCls, getDeclMethod, attachName, paramTypes);
     env->CallVoidMethod(attachMethodObj, setAcc, JNI_TRUE);
     jclass methodClass = env->FindClass("java/lang/reflect/Method");
-    jmethodID invokeMethod = env->GetMethodID(methodClass, "invoke",
-        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID invokeMethod = env->GetMethodID(methodClass, "invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
     jclass objClass = env->FindClass("java/lang/Object");
     jobjectArray invokeArgs = env->NewObjectArray(1, objClass, context);
     env->CallObjectMethod(attachMethodObj, invokeMethod, app, invokeArgs);
-
-    env->DeleteLocalRef(jclassName);
-    env->DeleteLocalRef(classLoader);
-    env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(classLoaderClass);
-    env->DeleteLocalRef(realClass);
-    env->DeleteLocalRef(appCls);
-    env->DeleteLocalRef(classCls);
-    env->DeleteLocalRef(accessCls);
-    env->DeleteLocalRef(attachName);
-    env->DeleteLocalRef(contextClass);
-    env->DeleteLocalRef(paramTypes);
-    env->DeleteLocalRef(attachMethodObj);
-    env->DeleteLocalRef(methodClass);
-    env->DeleteLocalRef(objClass);
-    env->DeleteLocalRef(invokeArgs);
+    env->DeleteLocalRef(jclassName); env->DeleteLocalRef(classLoader); env->DeleteLocalRef(ctxClass);
+    env->DeleteLocalRef(classLoaderClass); env->DeleteLocalRef(realClass); env->DeleteLocalRef(appCls);
+    env->DeleteLocalRef(classCls); env->DeleteLocalRef(accessCls); env->DeleteLocalRef(attachName);
+    env->DeleteLocalRef(contextClass); env->DeleteLocalRef(paramTypes); env->DeleteLocalRef(attachMethodObj);
+    env->DeleteLocalRef(methodClass); env->DeleteLocalRef(objClass); env->DeleteLocalRef(invokeArgs);
     return app;
 }
 
 void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
     jclass atClass = env->FindClass("android/app/ActivityThread");
-    jmethodID currentAt = env->GetStaticMethodID(atClass, "currentActivityThread",
-        "()Landroid/app/ActivityThread;");
+    jmethodID currentAt = env->GetStaticMethodID(atClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
     jobject activityThread = env->CallStaticObjectMethod(atClass, currentAt);
     jclass atCls = env->GetObjectClass(activityThread);
-
     jobject boundAppField = findField(env, atCls, "mBoundApplication");
     jobject boundApp = getFieldValue(env, boundAppField, activityThread);
     jclass boundAppCls = env->GetObjectClass(boundApp);
@@ -649,10 +560,8 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
     jclass loadedApkCls = env->GetObjectClass(loadedApk);
     jobject mAppField = findField(env, loadedApkCls, "mApplication");
     setFieldValue(env, mAppField, loadedApk, realApp);
-
     jobject initAppField = findField(env, atCls, "mInitialApplication");
     setFieldValue(env, initAppField, activityThread, realApp);
-
     const char* mapFields[] = {"mPackages", "mResourcePackages"};
     for (auto mapName : mapFields) {
         jobject mapField = findField(env, atCls, mapName);
@@ -672,15 +581,13 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
         jmethodID refGet = env->GetMethodID(refClass, "get", "()Ljava/lang/Object;");
         while (env->CallBooleanMethod(iter, hasNext)) {
             jobject ref = env->CallObjectMethod(iter, next);
-            jobject apk = env->IsInstanceOf(ref, refClass)
-                ? env->CallObjectMethod(ref, refGet) : ref;
+            jobject apk = env->IsInstanceOf(ref, refClass) ? env->CallObjectMethod(ref, refGet) : ref;
             if (!apk) { env->DeleteLocalRef(ref); continue; }
             jclass apkCls = env->GetObjectClass(apk);
             jobject apkAppField = findField(env, apkCls, "mApplication");
             if (apkAppField) {
                 jobject cur = getFieldValue(env, apkAppField, apk);
-                if (env->IsSameObject(cur, stubApp) || cur == nullptr)
-                    setFieldValue(env, apkAppField, apk, realApp);
+                if (env->IsSameObject(cur, stubApp) || cur == nullptr) setFieldValue(env, apkAppField, apk, realApp);
                 if (cur) env->DeleteLocalRef(cur);
                 env->DeleteLocalRef(apkAppField);
             }
@@ -688,16 +595,10 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
             if (apk != ref) env->DeleteLocalRef(apk);
             env->DeleteLocalRef(ref);
         }
-        env->DeleteLocalRef(iter);
-        env->DeleteLocalRef(iterClass);
-        env->DeleteLocalRef(colClass);
-        env->DeleteLocalRef(valCol);
-        env->DeleteLocalRef(mapClass);
-        env->DeleteLocalRef(pkgMap);
-        env->DeleteLocalRef(mapField);
-        env->DeleteLocalRef(refClass);
+        env->DeleteLocalRef(iter); env->DeleteLocalRef(iterClass); env->DeleteLocalRef(colClass);
+        env->DeleteLocalRef(valCol); env->DeleteLocalRef(mapClass); env->DeleteLocalRef(pkgMap);
+        env->DeleteLocalRef(mapField); env->DeleteLocalRef(refClass);
     }
-
     jobject allAppsField = findField(env, atCls, "mAllApplications");
     jobject allApps = getFieldValue(env, allAppsField, activityThread);
     jclass allAppsCls = env->GetObjectClass(allApps);
@@ -705,48 +606,31 @@ void swapInRealApp(JNIEnv* env, jobject stubApp, jobject realApp) {
     jmethodID addMethod = env->GetMethodID(allAppsCls, "add", "(Ljava/lang/Object;)Z");
     env->CallBooleanMethod(allApps, removeMethod, stubApp);
     env->CallBooleanMethod(allApps, addMethod, realApp);
-
-    env->DeleteLocalRef(atClass);
-    env->DeleteLocalRef(activityThread);
-    env->DeleteLocalRef(atCls);
-    env->DeleteLocalRef(boundAppField);
-    env->DeleteLocalRef(boundApp);
-    env->DeleteLocalRef(boundAppCls);
-    env->DeleteLocalRef(infoField);
-    env->DeleteLocalRef(loadedApk);
-    env->DeleteLocalRef(loadedApkCls);
-    env->DeleteLocalRef(mAppField);
-    env->DeleteLocalRef(initAppField);
-    env->DeleteLocalRef(allAppsField);
-    env->DeleteLocalRef(allApps);
-    env->DeleteLocalRef(allAppsCls);
+    env->DeleteLocalRef(atClass); env->DeleteLocalRef(activityThread); env->DeleteLocalRef(atCls);
+    env->DeleteLocalRef(boundAppField); env->DeleteLocalRef(boundApp); env->DeleteLocalRef(boundAppCls);
+    env->DeleteLocalRef(infoField); env->DeleteLocalRef(loadedApk); env->DeleteLocalRef(loadedApkCls);
+    env->DeleteLocalRef(mAppField); env->DeleteLocalRef(initAppField);
+    env->DeleteLocalRef(allAppsField); env->DeleteLocalRef(allApps); env->DeleteLocalRef(allAppsCls);
 }
 
 void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHex) {
     if (expectedHex.empty()) return;
     jclass ctxClass = env->GetObjectClass(context);
-    jmethodID getPm = env->GetMethodID(ctxClass, "getPackageManager",
-        "()Landroid/content/pm/PackageManager;");
+    jmethodID getPm = env->GetMethodID(ctxClass, "getPackageManager", "()Landroid/content/pm/PackageManager;");
     jmethodID getPkg = env->GetMethodID(ctxClass, "getPackageName", "()Ljava/lang/String;");
     jobject pm = env->CallObjectMethod(context, getPm);
     jstring pkg = static_cast<jstring>(env->CallObjectMethod(context, getPkg));
     jclass pmClass = env->GetObjectClass(pm);
-    jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
-        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+    jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
     jobject pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)0x8000000);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)64);
-    }
+    if (env->ExceptionCheck()) { env->ExceptionClear(); pi = env->CallObjectMethod(pm, getPackageInfo, pkg, (jint)64); }
     jclass piClass = env->GetObjectClass(pi);
     bool matched = false;
-    jfieldID sigInfoField = env->GetFieldID(piClass, "signingInfo",
-        "Landroid/content/pm/SigningInfo;");
+    jfieldID sigInfoField = env->GetFieldID(piClass, "signingInfo", "Landroid/content/pm/SigningInfo;");
     if (sigInfoField && !env->ExceptionCheck()) {
         jobject sigInfo = env->GetObjectField(pi, sigInfoField);
         jclass siClass = env->GetObjectClass(sigInfo);
-        jmethodID getSigners = env->GetMethodID(siClass, "getApkContentsSigners",
-            "()[Landroid/content/pm/Signature;");
+        jmethodID getSigners = env->GetMethodID(siClass, "getApkContentsSigners", "()[Landroid/content/pm/Signature;");
         jobjectArray sigs = static_cast<jobjectArray>(env->CallObjectMethod(sigInfo, getSigners));
         jclass sigClass = env->FindClass("android/content/pm/Signature");
         jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
@@ -758,17 +642,13 @@ void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHe
             std::vector<uint8_t> bytes(len);
             env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
             if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
+            env->DeleteLocalRef(sig); env->DeleteLocalRef(sigBytes);
         }
-        env->DeleteLocalRef(sigInfo);
-        env->DeleteLocalRef(siClass);
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
+        env->DeleteLocalRef(sigInfo); env->DeleteLocalRef(siClass);
+        env->DeleteLocalRef(sigs); env->DeleteLocalRef(sigClass);
     } else {
         if (env->ExceptionCheck()) env->ExceptionClear();
-        jfieldID sigsField = env->GetFieldID(piClass, "signatures",
-            "[Landroid/content/pm/Signature;");
+        jfieldID sigsField = env->GetFieldID(piClass, "signatures", "[Landroid/content/pm/Signature;");
         jobjectArray sigs = static_cast<jobjectArray>(env->GetObjectField(pi, sigsField));
         jclass sigClass = env->FindClass("android/content/pm/Signature");
         jmethodID toBytes = env->GetMethodID(sigClass, "toByteArray", "()[B");
@@ -780,18 +660,12 @@ void verifySignature(JNIEnv* env, jobject context, const std::string& expectedHe
             std::vector<uint8_t> bytes(len);
             env->GetByteArrayRegion(sigBytes, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
             if (bytesToHex(sha256Digest(bytes)) == expectedHex) matched = true;
-            env->DeleteLocalRef(sig);
-            env->DeleteLocalRef(sigBytes);
+            env->DeleteLocalRef(sig); env->DeleteLocalRef(sigBytes);
         }
-        env->DeleteLocalRef(sigs);
-        env->DeleteLocalRef(sigClass);
+        env->DeleteLocalRef(sigs); env->DeleteLocalRef(sigClass);
     }
-    env->DeleteLocalRef(ctxClass);
-    env->DeleteLocalRef(pm);
-    env->DeleteLocalRef(pkg);
-    env->DeleteLocalRef(pmClass);
-    env->DeleteLocalRef(pi);
-    env->DeleteLocalRef(piClass);
+    env->DeleteLocalRef(ctxClass); env->DeleteLocalRef(pm); env->DeleteLocalRef(pkg);
+    env->DeleteLocalRef(pmClass); env->DeleteLocalRef(pi); env->DeleteLocalRef(piClass);
     if (!matched) tamper("signature-mismatch");
 }
 
@@ -818,27 +692,22 @@ void hookModule(struct dl_phdr_info* info, const HookReq* reqs, int nreqs) {
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
             break;
         }
     }
     if (!dyn) return;
-    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
-        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
-    };
+    auto resolve = [&](ElfW(Addr) p) -> uintptr_t { return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p; };
     const char* strtab = nullptr;
     const ElfW(Sym)* symtab = nullptr;
     ElfW(Addr) jmprel = 0; size_t pltrelsz = 0; long pltrel = 0;
     for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
         switch (d->d_tag) {
-            case DT_STRTAB:
-                strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr)); break;
-            case DT_SYMTAB:
-                symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr)); break;
-            case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-            case DT_PLTREL: pltrel = d->d_un.d_val; break;
+            case DT_STRTAB:   strtab  = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr)); break;
+            case DT_SYMTAB:   symtab  = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr)); break;
+            case DT_JMPREL:   jmprel  = d->d_un.d_ptr; break;
+            case DT_PLTRELSZ: pltrelsz= d->d_un.d_val; break;
+            case DT_PLTREL:   pltrel  = d->d_un.d_val; break;
         }
     }
     if (!strtab || !symtab || !jmprel || !pltrelsz) return;
@@ -847,17 +716,14 @@ void hookModule(struct dl_phdr_info* info, const HookReq* reqs, int nreqs) {
         const char* name = strtab + symtab[symIdx].st_name;
         for (int k = 0; k < nreqs; ++k)
             if (strcmp(name, reqs[k].name) == 0)
-                patchSlot(reinterpret_cast<void**>(
-                    info->dlpi_addr + rOffset), reqs[k].repl);
+                patchSlot(reinterpret_cast<void**>(info->dlpi_addr + rOffset), reqs[k].repl);
     };
     if (pltrel == DT_RELA) {
         auto* r = reinterpret_cast<ElfW(Rela)*>(rel);
-        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); ++i)
-            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
+        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); ++i) tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
     } else {
         auto* r = reinterpret_cast<ElfW(Rel)*>(rel);
-        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rel)); ++i)
-            tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
+        for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rel)); ++i) tryHook(CA_R_SYM(r[i].r_info), r[i].r_offset);
     }
 }
 
@@ -895,31 +761,23 @@ int findSymCb(struct dl_phdr_info* info, size_t, void* data) {
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; ++i)
         if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
             break;
         }
     if (!dyn) return 0;
-    auto resolve = [&](ElfW(Addr) p) -> uintptr_t {
-        return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p;
-    };
+    auto resolve = [&](ElfW(Addr) p) -> uintptr_t { return (p < info->dlpi_addr) ? (info->dlpi_addr + p) : p; };
     const char* strtab = nullptr;
     const ElfW(Sym)* symtab = nullptr;
     size_t syment = sizeof(ElfW(Sym));
     for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; ++d) {
-        if (d->d_tag == DT_STRTAB)
-            strtab = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr));
-        else if (d->d_tag == DT_SYMTAB)
-            symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr));
-        else if (d->d_tag == DT_SYMENT)
-            syment = d->d_un.d_val;
+        if (d->d_tag == DT_STRTAB)  strtab  = reinterpret_cast<const char*>(resolve(d->d_un.d_ptr));
+        else if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<const ElfW(Sym)*>(resolve(d->d_un.d_ptr));
+        else if (d->d_tag == DT_SYMENT) syment = d->d_un.d_val;
     }
     if (!strtab || !symtab) return 0;
-    size_t count = (reinterpret_cast<uintptr_t>(strtab) -
-        reinterpret_cast<uintptr_t>(symtab)) / syment;
+    size_t count = (reinterpret_cast<uintptr_t>(strtab) - reinterpret_cast<uintptr_t>(symtab)) / syment;
     for (size_t i = 0; i < count; ++i) {
-        const ElfW(Sym)* s = reinterpret_cast<const ElfW(Sym)*>(
-            reinterpret_cast<const char*>(symtab) + i * syment);
+        const ElfW(Sym)* s = reinterpret_cast<const ElfW(Sym)*>(reinterpret_cast<const char*>(symtab) + i * syment);
         if (s->st_name == 0 || s->st_shndx == SHN_UNDEF) continue;
         if (strcmp(strtab + s->st_name, f->sym) == 0) {
             f->result = reinterpret_cast<void*>(info->dlpi_addr + s->st_value);
@@ -973,11 +831,8 @@ int modHookCb(struct dl_phdr_info* info, size_t, void* data) {
 }
 
 void installSoHook() {
-    g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
-        dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
-    if (!g_realDlopenExt)
-        g_realDlopenExt = reinterpret_cast<DlopenExtFn>(
-            symFrom("libdl", "android_dlopen_ext"));
+    g_realDlopenExt = reinterpret_cast<DlopenExtFn>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    if (!g_realDlopenExt) g_realDlopenExt = reinterpret_cast<DlopenExtFn>(symFrom("libdl", "android_dlopen_ext"));
     if (!g_realDlopenExt) return;
     HookReq req{"android_dlopen_ext", reinterpret_cast<void*>(&myDlopenExt)};
     ModHook mh{"libnativeloader", &req, 1};
@@ -985,10 +840,8 @@ void installSoHook() {
 }
 
 void installAssetHook() {
-    g_createFromFd = reinterpret_cast<CreateFromFdFn>(symFrom("libandroidfw.so",
-        "_ZN7android5Asset12createFromFdEiPKcNS0_10AccessModeE"));
-    g_open = reinterpret_cast<OpenFn>(symFrom("libandroidfw.so",
-        "_ZNK7android13AssetManager24OpenERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS_5Asset10AccessModeE"));
+    g_createFromFd = reinterpret_cast<CreateFromFdFn>(symFrom("libandroidfw.so", "_ZN7android5Asset12createFromFdEiPKcNS0_10AccessModeE"));
+    g_open = reinterpret_cast<OpenFn>(symFrom("libandroidfw.so", "_ZNK7android13AssetManager24OpenERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS_5Asset10AccessModeE"));
 }
 
 }
@@ -1002,19 +855,21 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
 
     uint8_t kek[KEK_LEN];
     loadKek(kek);
-    uint8_t propsKeyRaw[KEK_LEN + 16];
-    memcpy(propsKeyRaw, kek, KEK_LEN);
-    memcpy(propsKeyRaw + KEK_LEN, "rscoders-props16", 16);
+
+    uint8_t propsKeyInput[KEK_LEN + 16];
+    memcpy(propsKeyInput, kek, KEK_LEN);
+    memcpy(propsKeyInput + KEK_LEN, "rscoders-props16", 16);
     memset(kek, 0, sizeof(kek));
-    std::vector<uint8_t> propsKeyInput(propsKeyRaw, propsKeyRaw + sizeof(propsKeyRaw));
-    memset(propsKeyRaw, 0, sizeof(propsKeyRaw));
-    std::vector<uint8_t> propsKey = sha256Digest(propsKeyInput);
+
+    std::vector<uint8_t> propsKeyVec(propsKeyInput, propsKeyInput + sizeof(propsKeyInput));
+    memset(propsKeyInput, 0, sizeof(propsKeyInput));
+    std::vector<uint8_t> propsKey = sha256Digest(propsKeyVec);
 
     std::vector<uint8_t> encProps = readAssetNative(env, context, "rscoders.bin");
     if (encProps.empty()) tamper("props-missing");
-    size_t plainLen = encProps.size() - 12 - 16;
-    std::vector<uint8_t> plainProps(plainLen);
-    if (!ca::aes256_gcm_decrypt(propsKey.data(), encProps.data(), encProps.size(), plainProps.data()))
+
+    std::vector<uint8_t> plainProps;
+    if (!rs_pipeline_decrypt(propsKey.data(), propsKey.size(), encProps.data(), encProps.size(), plainProps))
         tamper("props-decrypt");
     std::fill(propsKey.begin(), propsKey.end(), 0);
 
@@ -1051,13 +906,10 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         bool any = false;
         while (std::getline(ss, name, ',')) {
             if (name.empty()) continue;
-            std::vector<uint8_t> enc = readAssetNative(env, context,
-                ("rscoders/enc/" + name).c_str());
+            std::vector<uint8_t> enc = readAssetNative(env, context, ("rscoders/enc/" + name).c_str());
             if (enc.empty()) continue;
-            size_t plen = enc.size() - 12 - 16;
-            std::vector<uint8_t> plain(plen);
-            if (!ca::aes256_gcm_decrypt(g_assetKey.data(), enc.data(), enc.size(),
-                plain.data())) continue;
+            std::vector<uint8_t> plain;
+            if (!rs_pipeline_decrypt(g_assetKey.data(), g_assetKey.size(), enc.data(), enc.size(), plain)) continue;
             (*g_protected)[name] = std::move(plain);
             any = true;
         }
@@ -1073,8 +925,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         std::vector<uint8_t> soKey = sha256Digest(soKeyInput);
 
         jclass ctxClass = env->GetObjectClass(context);
-        jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo",
-            "()Landroid/content/pm/ApplicationInfo;");
+        jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
         jobject appInfo = env->CallObjectMethod(context, getAppInfo);
         jclass aiClass = env->GetObjectClass(appInfo);
         jfieldID sourceDirField = env->GetFieldID(aiClass, "sourceDir", "Ljava/lang/String;");
@@ -1089,13 +940,10 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
             jclass zipClass = env->FindClass("java/util/zip/ZipFile");
             jmethodID zipCtor = env->GetMethodID(zipClass, "<init>", "(Ljava/lang/String;)V");
             jobject zip = env->NewObject(zipClass, zipCtor, sourceDir);
-            jmethodID getEntry = env->GetMethodID(zipClass, "getEntry",
-                "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;");
+            jmethodID getEntry = env->GetMethodID(zipClass, "getEntry", "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;");
             jclass buildClass = env->FindClass("android/os/Build");
-            jfieldID supportedAbis = env->GetStaticFieldID(buildClass, "SUPPORTED_ABIS",
-                "[Ljava/lang/String;");
-            jobjectArray abis = static_cast<jobjectArray>(
-                env->GetStaticObjectField(buildClass, supportedAbis));
+            jfieldID supportedAbis = env->GetStaticFieldID(buildClass, "SUPPORTED_ABIS", "[Ljava/lang/String;");
+            jobjectArray abis = static_cast<jobjectArray>(env->GetStaticObjectField(buildClass, supportedAbis));
             jstring firstAbi = static_cast<jstring>(env->GetObjectArrayElement(abis, 0));
             const char* abiStr = env->GetStringUTFChars(firstAbi, nullptr);
             std::string entryName = std::string("lib/") + abiStr + "/" + soName;
@@ -1103,8 +951,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
             jstring jEntry = env->NewStringUTF(entryName.c_str());
             jobject entry = env->CallObjectMethod(zip, getEntry, jEntry);
             if (entry) {
-                jmethodID getInputStream = env->GetMethodID(zipClass, "getInputStream",
-                    "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;");
+                jmethodID getInputStream = env->GetMethodID(zipClass, "getInputStream", "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;");
                 jobject is = env->CallObjectMethod(zip, getInputStream, entry);
                 jclass isClass = env->GetObjectClass(is);
                 jmethodID readMethod = env->GetMethodID(isClass, "read", "([B)I");
@@ -1116,38 +963,28 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
                     encBytes.insert(encBytes.end(), data, data + n);
                     env->ReleaseByteArrayElements(buf, data, JNI_ABORT);
                 }
-                env->DeleteLocalRef(buf);
-                env->DeleteLocalRef(isClass);
-                env->DeleteLocalRef(is);
+                env->DeleteLocalRef(buf); env->DeleteLocalRef(isClass); env->DeleteLocalRef(is);
                 if (!encBytes.empty()) {
-                    size_t plen = encBytes.size() - 12 - 16;
-                    std::vector<uint8_t> plain(plen);
-                    if (ca::aes256_gcm_decrypt(soKey.data(), encBytes.data(),
-                        encBytes.size(), plain.data())) {
+                    std::vector<uint8_t> plain;
+                    if (rs_pipeline_decrypt(soKey.data(), soKey.size(), encBytes.data(), encBytes.size(), plain)) {
                         (*g_protectedSo)[soName] = std::move(plain);
                         any = true;
                     }
                 }
                 env->DeleteLocalRef(entry);
             }
-            env->DeleteLocalRef(jEntry);
-            env->DeleteLocalRef(abis);
-            env->DeleteLocalRef(firstAbi);
-            env->DeleteLocalRef(buildClass);
-            env->DeleteLocalRef(zip);
-            env->DeleteLocalRef(zipClass);
+            env->DeleteLocalRef(jEntry); env->DeleteLocalRef(abis); env->DeleteLocalRef(firstAbi);
+            env->DeleteLocalRef(buildClass); env->DeleteLocalRef(zip); env->DeleteLocalRef(zipClass);
         }
-        env->DeleteLocalRef(sourceDir);
-        env->DeleteLocalRef(appInfo);
-        env->DeleteLocalRef(aiClass);
-        env->DeleteLocalRef(ctxClass);
+        env->DeleteLocalRef(sourceDir); env->DeleteLocalRef(appInfo);
+        env->DeleteLocalRef(aiClass); env->DeleteLocalRef(ctxClass);
         if (any) installSoHook();
     }
 
     if (propFlag(props, "guard.logSuppression")) {
         static const HookReq reqs[] = {
-            {"__android_log_print", reinterpret_cast<void*>(&logPrintNoop)},
-            {"__android_log_write", reinterpret_cast<void*>(&logWriteNoop)},
+            {"__android_log_print",     reinterpret_cast<void*>(&logPrintNoop)},
+            {"__android_log_write",     reinterpret_cast<void*>(&logWriteNoop)},
             {"__android_log_buf_write", reinterpret_cast<void*>(&logBufWriteNoop)},
         };
         pltHookAll(reqs, 3);
@@ -1202,8 +1039,8 @@ Java_com_rscoders_stub_StubApp_nativeInstallAntiPtrace(JNIEnv*, jclass) {
 JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeSuppressLogs(JNIEnv*, jclass) {
     static const HookReq reqs[] = {
-        {"__android_log_print", reinterpret_cast<void*>(&logPrintNoop)},
-        {"__android_log_write", reinterpret_cast<void*>(&logWriteNoop)},
+        {"__android_log_print",     reinterpret_cast<void*>(&logPrintNoop)},
+        {"__android_log_write",     reinterpret_cast<void*>(&logWriteNoop)},
         {"__android_log_buf_write", reinterpret_cast<void*>(&logBufWriteNoop)},
     };
     pltHookAll(reqs, 3);
@@ -1212,19 +1049,17 @@ Java_com_rscoders_stub_StubApp_nativeSuppressLogs(JNIEnv*, jclass) {
 JNIEXPORT jbyteArray JNICALL
 Java_com_rscoders_stub_StubApp_nativeUnwrapDek(JNIEnv* env, jclass, jbyteArray wrapped) {
     jsize n = env->GetArrayLength(wrapped);
-    if (n < 12 + 16) return nullptr;
+    if (n < 4) return nullptr;
     std::vector<uint8_t> in(static_cast<size_t>(n));
     env->GetByteArrayRegion(wrapped, 0, n, reinterpret_cast<jbyte*>(in.data()));
     uint8_t kek[KEK_LEN];
     loadKek(kek);
-    size_t outLen = static_cast<size_t>(n) - 12 - 16;
-    std::vector<uint8_t> out(outLen);
-    bool ok = ca::aes256_gcm_decrypt(kek, in.data(), in.size(), out.data());
+    std::vector<uint8_t> out;
+    bool ok = rs_pipeline_decrypt(kek, KEK_LEN, in.data(), in.size(), out);
     memset(kek, 0, sizeof(kek));
     if (!ok) return nullptr;
-    jbyteArray res = env->NewByteArray(static_cast<jsize>(outLen));
-    env->SetByteArrayRegion(res, 0, static_cast<jsize>(outLen),
-        reinterpret_cast<jbyte*>(out.data()));
+    jbyteArray res = env->NewByteArray(static_cast<jsize>(out.size()));
+    env->SetByteArrayRegion(res, 0, static_cast<jsize>(out.size()), reinterpret_cast<jbyte*>(out.data()));
     return res;
 }
 
@@ -1243,8 +1078,7 @@ Java_com_rscoders_stub_StubApp_nativeGetPropsKey(JNIEnv* env, jclass) {
 }
 
 JNIEXPORT void JNICALL
-Java_com_rscoders_stub_StubApp_nativeRegisterProtectedAsset(JNIEnv* env, jclass,
-                                                             jstring name, jbyteArray data) {
+Java_com_rscoders_stub_StubApp_nativeRegisterProtectedAsset(JNIEnv* env, jclass, jstring name, jbyteArray data) {
     if (!g_protected) g_protected = new std::map<std::string, std::vector<uint8_t>>();
     const char* c = env->GetStringUTFChars(name, nullptr);
     std::string fn(c ? c : "");
@@ -1262,8 +1096,7 @@ Java_com_rscoders_stub_StubApp_nativeInstallAssetHook(JNIEnv*, jclass) {
 }
 
 JNIEXPORT void JNICALL
-Java_com_rscoders_stub_StubApp_nativeRegisterProtectedSo(JNIEnv* env, jclass,
-                                                          jstring name, jbyteArray data) {
+Java_com_rscoders_stub_StubApp_nativeRegisterProtectedSo(JNIEnv* env, jclass, jstring name, jbyteArray data) {
     if (!g_protectedSo) g_protectedSo = new std::map<std::string, std::vector<uint8_t>>();
     const char* c = env->GetStringUTFChars(name, nullptr);
     std::string fn(c ? c : "");
