@@ -12,6 +12,19 @@ data class SigningConfig(
     val v3Enabled: Boolean = true,
 )
 
+data class SslPinningConfig(
+    val enabled: Boolean = false,
+    val pins: List<SslPin> = emptyList(),
+    val enforcePinning: Boolean = true,
+    val allowUserCerts: Boolean = false,
+)
+
+data class SslPin(
+    val hostname: String,
+    val sha256Pins: List<String>,
+    val includeSubdomains: Boolean = false,
+)
+
 data class ProtectionOptions(
     val signatureVerification: Boolean = true,
     val fileIntegrityVerification: Boolean = true,
@@ -25,28 +38,18 @@ data class ProtectionOptions(
     val doubleOpenDetection: Boolean = false,
     val accessibilityDetection: Boolean = false,
     val logSuppression: Boolean = false,
-    val sslPinning: Boolean = false,
+    val sslPinning: SslPinningConfig = SslPinningConfig(),
 ) {
     companion object {
         val DEFAULT = ProtectionOptions()
         val STRICT = ProtectionOptions(
-            antiPtrace = true,
-            rootDetection = true,
-            emulatorDetection = true,
-            doubleOpenDetection = true,
-            accessibilityDetection = true,
-            logSuppression = true,
-            sslPinning = true,
+            antiPtrace = true, rootDetection = true, emulatorDetection = true,
+            doubleOpenDetection = true, accessibilityDetection = true, logSuppression = true,
         )
         val NONE = ProtectionOptions(
-            signatureVerification = false,
-            fileIntegrityVerification = false,
-            debuggingDetection = false,
-            antiPtrace = false,
-            antiReverseTools = false,
-            screenCapturePrevention = false,
-            antiHijacking = false,
-            sslPinning = false,
+            signatureVerification = false, fileIntegrityVerification = false,
+            debuggingDetection = false, antiPtrace = false, antiReverseTools = false,
+            screenCapturePrevention = false, antiHijacking = false,
         )
     }
 }
@@ -63,5 +66,4 @@ data class HardeningConfig(
     val protectNativeLibs: Boolean = false,
     val workDir: File? = null,
     val keepWorkDir: Boolean = false,
-    val sslPins: List<String> = emptyList(),
 )
