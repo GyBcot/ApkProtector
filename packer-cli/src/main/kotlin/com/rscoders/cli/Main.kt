@@ -5,6 +5,8 @@ import com.rscoders.core.HardeningConfig
 import com.rscoders.core.HardeningPipeline
 import com.rscoders.core.ProtectionOptions
 import com.rscoders.core.SigningConfig
+import com.rscoders.core.SslPin
+import com.rscoders.core.SslPinningConfig
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.core.main
 import com.github.ajalt.clikt.parameters.options.default
@@ -52,14 +54,19 @@ class Harden : CliktCommand(name = "harden") {
         "--protect-so",
         help = "encrypt the app's own native libraries (transparent in-memory load)",
     ).flag(default = false)
-    private val sslPinning by option(
-        "--ssl-pinning",
-        help = "enable SSL pinning using SPKI public key hash",
-    ).flag(default = false)
+
     private val sslPin by option(
         "--ssl-pin",
-        help = "SPKI SHA-256 hex pin (repeatable)",
+        help = "SSL pin: format hostname:sha256base64 (repeatable, use * prefix for subdomains)",
     ).multiple()
+    private val noSslPinEnforce by option(
+        "--no-ssl-pin-enforce",
+        help = "report SSL pinning failures via log instead of killing the process",
+    ).flag(default = false)
+    private val sslPinAllowUserCerts by option(
+        "--ssl-pin-allow-user-certs",
+        help = "allow user-installed CA certificates alongside pins",
+    ).flag(default = false)
 
     override fun run() {
         val shells = buildMap {
@@ -79,6 +86,15 @@ class Harden : CliktCommand(name = "harden") {
             "none" -> ProtectionOptions.NONE
             else -> ProtectionOptions.DEFAULT
         }
+
+        val parsedPins = parseSslPins(sslPin)
+        val sslPinningConfig = SslPinningConfig(
+            enabled = parsedPins.isNotEmpty(),
+            pins = parsedPins,
+            enforcePinning = !noSslPinEnforce,
+            allowUserCerts = sslPinAllowUserCerts,
+        )
+
         val protection = base.copy(
             antiPtrace = base.antiPtrace || antiPtrace,
             rootDetection = base.rootDetection || rootDetection,
@@ -87,12 +103,8 @@ class Harden : CliktCommand(name = "harden") {
             accessibilityDetection = base.accessibilityDetection || accessibility,
             logSuppression = base.logSuppression || logSuppress,
             screenCapturePrevention = if (noSecureScreen) false else base.screenCapturePrevention,
-            sslPinning = base.sslPinning || sslPinning,
+            sslPinning = sslPinningConfig,
         )
-
-        if (protection.sslPinning && sslPin.isEmpty()) {
-            echo("WARNING: --ssl-pinning enabled but no --ssl-pin provided; SSL pinning will be skipped.")
-        }
 
         val pipeline = HardeningPipeline(AndroidSdk.locate())
         val result = pipeline.harden(
@@ -107,18 +119,34 @@ class Harden : CliktCommand(name = "harden") {
                 protectNativeLibs = protectSo,
                 keepWorkDir = keepWork,
                 workDir = if (keepWork) File("work/cli") else null,
-                sslPins = sslPin,
             ),
         )
 
-        echo("hardened: ${result.outputApk}")
+        echo("✔ hardened: ${result.outputApk}")
         echo("  original Application : ${result.originalApplicationClass ?: "<default>"}")
         echo("  encrypted DEX        : ${result.encryptedDexCount}")
         echo("  payload              : ${result.payloadBytes} bytes")
         echo("  signed               : ${result.signed}")
         echo("  screen capture       : ${if (protection.screenCapturePrevention) "disabled" else "allowed"}")
-        echo("  ssl pinning          : ${if (protection.sslPinning && sslPin.isNotEmpty()) "enabled (${sslPin.size} pin(s))" else "disabled"}")
-        result.steps.forEach { echo("  - ${it.name}: ${it.detail}") }
+        echo("  ssl pinning          : ${if (sslPinningConfig.enabled) "${sslPinningConfig.pins.size} host(s)" else "disabled"}")
+        result.steps.forEach { echo("  • ${it.name}: ${it.detail}") }
+    }
+
+    private fun parseSslPins(raw: List<String>): List<SslPin> {
+        val map = LinkedHashMap<String, Pair<Boolean, MutableList<String>>>()
+        for (entry in raw) {
+            val colon = entry.lastIndexOf(':')
+            require(colon > 0) { "Invalid --ssl-pin format '$entry', expected hostname:sha256base64" }
+            val hostRaw = entry.substring(0, colon)
+            val pin = entry.substring(colon + 1)
+            val includeSub = hostRaw.startsWith("*.")
+            val host = if (includeSub) hostRaw.removePrefix("*.") else hostRaw
+            val (_, pins) = map.getOrPut(host) { Pair(includeSub, mutableListOf()) }
+            pins += pin
+        }
+        return map.map { (host, pair) ->
+            SslPin(hostname = host, sha256Pins = pair.second, includeSubdomains = pair.first)
+        }
     }
 }
 
