@@ -10,9 +10,7 @@ object ShellPatcher {
     fun patch(soBytes: ByteArray, kek: ByteArray): ByteArray {
         require(kek.size == KEK_LEN) { "KEK must be $KEK_LEN bytes" }
         val at = indexOf(soBytes, MAGIC)
-        require(at >= 0) {
-            "KEK marker not found in librscoders.so — rebuild the shell (shell-native/build-native.sh)"
-        }
+        require(at >= 0) { "KEK marker not found in librscoders.so" }
         val out = soBytes.copyOf()
         System.arraycopy(kek, 0, out, at + MAGIC.size, KEK_LEN)
         return out
