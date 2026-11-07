@@ -13,40 +13,30 @@ data class SigningConfig(
 )
 
 data class ProtectionOptions(
-    val signatureVerification: Boolean = true,
+    val signatureVerification: Boolean = true, 
     val fileIntegrityVerification: Boolean = true,
-    val debuggingDetection: Boolean = true,
-    val antiReverseTools: Boolean = true,
-    val screenCapturePrevention: Boolean = true,
-    val antiHijacking: Boolean = true,
-    val antiPtrace: Boolean = false,
-    val rootDetection: Boolean = false,
-    val emulatorDetection: Boolean = false,
+    val debuggingDetection: Boolean = true,  
+    val antiReverseTools: Boolean = true,     
+    val screenCapturePrevention: Boolean = true, 
+    val antiHijacking: Boolean = true,         
+    val antiPtrace: Boolean = false,           
+    val rootDetection: Boolean = false,        
+    val emulatorDetection: Boolean = false, 
     val doubleOpenDetection: Boolean = false,
     val accessibilityDetection: Boolean = false,
-    val logSuppression: Boolean = false,
-    val sslPinning: Boolean = false,
+    val logSuppression: Boolean = false,  
 ) {
     companion object {
         val DEFAULT = ProtectionOptions()
         val STRICT = ProtectionOptions(
-            antiPtrace = true,
-            rootDetection = true,
-            emulatorDetection = true,
-            doubleOpenDetection = true,
-            accessibilityDetection = true,
-            logSuppression = true,
-            sslPinning = true,
+            antiPtrace = true, rootDetection = true, emulatorDetection = true,
+            doubleOpenDetection = true, accessibilityDetection = true, logSuppression = true,
         )
+
         val NONE = ProtectionOptions(
-            signatureVerification = false,
-            fileIntegrityVerification = false,
-            debuggingDetection = false,
-            antiPtrace = false,
-            antiReverseTools = false,
-            screenCapturePrevention = false,
-            antiHijacking = false,
-            sslPinning = false,
+            signatureVerification = false, fileIntegrityVerification = false,
+            debuggingDetection = false, antiPtrace = false, antiReverseTools = false,
+            screenCapturePrevention = false, antiHijacking = false,
         )
     }
 }
@@ -63,5 +53,4 @@ data class HardeningConfig(
     val protectNativeLibs: Boolean = false,
     val workDir: File? = null,
     val keepWorkDir: Boolean = false,
-    val sslPins: List<String> = emptyList(),
 )
