@@ -1111,69 +1111,34 @@ bool verifySslPinForHost(JNIEnv* env, const std::string& host, jobjectArray cert
     return pinMatched;
 }
 
-static jobject g_pinnedTrustManager = nullptr;
-static jmethodID g_origCheckServerTrusted = nullptr;
-static jclass g_pinnedTMClass = nullptr;
-
 static JavaVM* s_vm = nullptr;
-
-static jobject g_realTrustManagerRef = nullptr;
 
 void installSslPinningJava(JNIEnv* env, jobject context) {
     if (g_sslPins.empty() || g_sslPinInstalled) return;
 
-    jclass sslfClass = env->FindClass("javax/net/ssl/SSLContext");
-    if (!sslfClass || env->ExceptionCheck()) {
+    jclass stubAppClass = env->FindClass("com/rscoders/stub/StubApp");
+    if (!stubAppClass || env->ExceptionCheck()) {
         env->ExceptionClear();
         return;
     }
 
-    jmethodID getDefault = env->GetStaticMethodID(sslfClass, "getDefault",
-        "()Ljavax/net/ssl/SSLContext;");
-    jobject defaultCtx = env->CallStaticObjectMethod(sslfClass, getDefault);
+    jmethodID installMethod = env->GetStaticMethodID(stubAppClass, "installJavaSslPinning", "(Z)V");
+    if (!installMethod || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(stubAppClass);
+        return;
+    }
+
+    env->CallStaticVoidMethod(stubAppClass, installMethod,
+        g_sslPinAllowUserCerts ? JNI_TRUE : JNI_FALSE);
+
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
-        env->DeleteLocalRef(sslfClass);
+        env->DeleteLocalRef(stubAppClass);
         return;
     }
 
-    jclass sslCtxClass = env->GetObjectClass(defaultCtx);
-    jmethodID getSocketFactory = env->GetMethodID(sslCtxClass, "getSocketFactory",
-        "()Ljavax/net/ssl/SSLSocketFactory;");
-    jobject factory = env->CallObjectMethod(defaultCtx, getSocketFactory);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        env->DeleteLocalRef(sslCtxClass);
-        env->DeleteLocalRef(defaultCtx);
-        env->DeleteLocalRef(sslfClass);
-        return;
-    }
-
-    jclass tmfClass = env->FindClass("javax/net/ssl/TrustManagerFactory");
-    jmethodID tmfGetDefault = env->GetStaticMethodID(tmfClass, "getDefaultAlgorithm",
-        "()Ljava/lang/String;");
-    jstring algo = static_cast<jstring>(env->CallStaticObjectMethod(tmfClass, tmfGetDefault));
-    jmethodID tmfGetInstance = env->GetStaticMethodID(tmfClass, "getInstance",
-        "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;");
-    jobject tmf = env->CallStaticObjectMethod(tmfClass, tmfGetInstance, algo);
-    jmethodID tmfInit = env->GetMethodID(tmfClass, "init", "(Ljava/security/KeyStore;)V");
-    env->CallVoidMethod(tmf, tmfInit, nullptr);
-    jmethodID getTMs = env->GetMethodID(tmfClass, "getTrustManagers",
-        "()[Ljavax/net/ssl/TrustManager;");
-    jobjectArray tms = static_cast<jobjectArray>(env->CallObjectMethod(tmf, getTMs));
-    jobject systemTM = env->GetObjectArrayElement(tms, 0);
-    g_realTrustManagerRef = env->NewGlobalRef(systemTM);
-
-    env->DeleteLocalRef(factory);
-    env->DeleteLocalRef(sslCtxClass);
-    env->DeleteLocalRef(defaultCtx);
-    env->DeleteLocalRef(sslfClass);
-    env->DeleteLocalRef(tmfClass);
-    env->DeleteLocalRef(algo);
-    env->DeleteLocalRef(tmf);
-    env->DeleteLocalRef(tms);
-    env->DeleteLocalRef(systemTM);
-
+    env->DeleteLocalRef(stubAppClass);
     g_sslPinInstalled = true;
     LOGI("SSL pinning installed for %zu host(s)", g_sslPins.size());
 }
@@ -1490,6 +1455,7 @@ Java_com_rscoders_stub_StubApp_nativeInstallSslPinning(JNIEnv* env, jclass,
     g_sslPins = parseSslPinsJson(json);
     g_sslPinEnforce = (enforce == JNI_TRUE);
     g_sslPinAllowUserCerts = (allowUserCerts == JNI_TRUE);
+    g_sslPinInstalled = false;
     jobject ctx = g_refs.applicationContext;
     if (ctx) installSslPinningJava(env, ctx);
 }
