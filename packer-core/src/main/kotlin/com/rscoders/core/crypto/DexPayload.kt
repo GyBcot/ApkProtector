@@ -15,17 +15,11 @@ object DexPayload {
             DataOutputStream(bos).use { d ->
                 d.write(CONTAINER_MAGIC)
                 d.writeInt(dexBlobs.size)
-                for (dex in dexBlobs) {
-                    d.writeInt(dex.size)
-                    d.write(dex)
-                }
+                for (dex in dexBlobs) { d.writeInt(dex.size); d.write(dex) }
             }
         }.toByteArray()
-
-        val wrappedDek = AesGcm.encrypt(kek, dek)
-
-        val body = AesGcm.encrypt(dek, deflate(container))
-
+        val wrappedDek = RsCodersKdf.encrypt(kek, dek)
+        val body = RsCodersKdf.encrypt(dek, deflate(container))
         return ByteArrayOutputStream().also { bos ->
             DataOutputStream(bos).use { d ->
                 d.write(PAYLOAD_MAGIC)
@@ -41,10 +35,8 @@ object DexPayload {
             require(magic.contentEquals(PAYLOAD_MAGIC)) { "bad payload magic" }
             val wrappedDek = ByteArray(d.readInt()).also(d::readFully)
             val body = ByteArray(d.readInt()).also(d::readFully)
-
-            val dek = AesGcm.decrypt(kek, wrappedDek)
-            val container = inflate(AesGcm.decrypt(dek, body))
-
+            val dek = RsCodersKdf.decrypt(kek, wrappedDek)
+            val container = inflate(RsCodersKdf.decrypt(dek, body))
             DataInputStream(container.inputStream()).use { c ->
                 val cmagic = ByteArray(4).also(c::readFully)
                 require(cmagic.contentEquals(CONTAINER_MAGIC)) { "bad container magic" }
