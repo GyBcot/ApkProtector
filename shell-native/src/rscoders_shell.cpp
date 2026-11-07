@@ -39,6 +39,7 @@ namespace {
 constexpr int KEK_LEN = 32;
 static volatile bool g_screenCapturePrevention = false;
 static volatile bool g_antiHijacking = false;
+static volatile bool g_sslPinningEnabled = false;
 static volatile jobject g_realAppRef = nullptr;
 static std::vector<std::string> g_sslPins;
 
@@ -316,33 +317,14 @@ void installAntiPtrace() {
     }
 }
 
-static void installSslPinning(JNIEnv* env, jobject context, const std::string& pinsStr) {
+static void storeSslPins(const std::string& pinsStr) {
     if (pinsStr.empty()) return;
     std::istringstream ss(pinsStr);
     std::string pin;
     while (std::getline(ss, pin, ',')) {
         if (!pin.empty()) g_sslPins.push_back(pin);
     }
-    if (g_sslPins.empty()) return;
-    jclass networkSecurityClass = env->FindClass("android/security/NetworkSecurityPolicy");
-    if (networkSecurityClass && !env->ExceptionCheck()) {
-        jmethodID getInstance = env->GetStaticMethodID(networkSecurityClass, "getInstance",
-            "()Landroid/security/NetworkSecurityPolicy;");
-        if (getInstance && !env->ExceptionCheck()) {
-            jobject policy = env->CallStaticObjectMethod(networkSecurityClass, getInstance);
-            jmethodID setCleartext = env->GetMethodID(networkSecurityClass,
-                "setCleartextTrafficPermitted", "(Z)V");
-            if (setCleartext && !env->ExceptionCheck()) {
-                env->CallVoidMethod(policy, setCleartext, JNI_FALSE);
-            }
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            env->DeleteLocalRef(policy);
-        }
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(networkSecurityClass);
-    }
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    LOGW("SSL pinning installed via JNI: %zu pin(s)", g_sslPins.size());
+    g_sslPinningEnabled = !g_sslPins.empty();
 }
 
 static bool verifySslPinJni(JNIEnv* env, jobject chain) {
@@ -354,11 +336,6 @@ static bool verifySslPinJni(JNIEnv* env, jobject chain) {
     env->DeleteLocalRef(chainClass);
     jclass x509Class = env->FindClass("java/security/cert/X509Certificate");
     jmethodID getPublicKey = env->GetMethodID(x509Class, "getPublicKey", "()Ljava/security/PublicKey;");
-    jclass keyFactoryClass = env->FindClass("java/security/KeyFactory");
-    jmethodID kfGetInstance = env->GetStaticMethodID(keyFactoryClass, "getInstance",
-        "(Ljava/lang/String;)Ljava/security/KeyFactory;");
-    jclass x509SpecClass = env->FindClass("java/security/spec/X509EncodedKeySpec");
-    jmethodID x509SpecCtor = env->GetMethodID(x509SpecClass, "<init>", "([B)V");
     jclass pubKeyClass = env->FindClass("java/security/PublicKey");
     jmethodID getEncoded = env->GetMethodID(pubKeyClass, "getEncoded", "()[B");
     jclass mdClass = env->FindClass("java/security/MessageDigest");
@@ -389,8 +366,6 @@ static bool verifySslPinJni(JNIEnv* env, jobject chain) {
     env->DeleteLocalRef(md);
     env->DeleteLocalRef(mdClass);
     env->DeleteLocalRef(pubKeyClass);
-    env->DeleteLocalRef(x509SpecClass);
-    env->DeleteLocalRef(keyFactoryClass);
     env->DeleteLocalRef(x509Class);
     return matched;
 }
@@ -1110,9 +1085,14 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     auto dexBlobs = unpackPayload(payload);
     if (dexBlobs.empty()) tamper("payload-unpack");
     injectDex(env, context, dexBlobs);
+
     if (propFlag(props, "guard.sslPinning")) {
-        installSslPinning(env, context, propStr(props, "guard.sslPins"));
+        std::string pinsStr = propStr(props, "guard.sslPinsHex");
+        if (pinsStr.empty()) pinsStr = propStr(props, "guard.sslPins");
+        storeSslPins(pinsStr);
+        LOGW("SSL pinning stored: %zu pin(s)", g_sslPins.size());
     }
+
     g_screenCapturePrevention = propFlag(props, "guard.screenCapturePrevention");
     g_antiHijacking = propFlag(props, "guard.antiHijacking");
     std::string protectedAssets = propStr(props, "guard.protectedAssets");
@@ -1350,6 +1330,24 @@ Java_com_rscoders_stub_StubApp_nativeInstallSoHook(JNIEnv*, jclass) {
 JNIEXPORT jboolean JNICALL
 Java_com_rscoders_stub_StubApp_nativeVerifySslPin(JNIEnv* env, jclass, jobject chain) {
     return verifySslPinJni(env, chain) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_rscoders_stub_StubApp_nativeGetSslPins(JNIEnv* env, jclass) {
+    jclass strClass = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray(static_cast<jsize>(g_sslPins.size()), strClass, nullptr);
+    for (int i = 0; i < (int)g_sslPins.size(); i++) {
+        jstring s = env->NewStringUTF(g_sslPins[i].c_str());
+        env->SetObjectArrayElement(arr, i, s);
+        env->DeleteLocalRef(s);
+    }
+    env->DeleteLocalRef(strClass);
+    return arr;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_rscoders_stub_StubApp_nativeIsSslPinningEnabled(JNIEnv*, jclass) {
+    return g_sslPinningEnabled ? JNI_TRUE : JNI_FALSE;
 }
 
 }
