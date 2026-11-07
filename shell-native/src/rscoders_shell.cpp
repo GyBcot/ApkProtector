@@ -318,14 +318,12 @@ void installAntiPtrace() {
 
 static void installSslPinning(JNIEnv* env, jobject context, const std::string& pinsStr) {
     if (pinsStr.empty()) return;
-
     std::istringstream ss(pinsStr);
     std::string pin;
     while (std::getline(ss, pin, ',')) {
         if (!pin.empty()) g_sslPins.push_back(pin);
     }
     if (g_sslPins.empty()) return;
-
     jclass networkSecurityClass = env->FindClass("android/security/NetworkSecurityPolicy");
     if (networkSecurityClass && !env->ExceptionCheck()) {
         jmethodID getInstance = env->GetStaticMethodID(networkSecurityClass, "getInstance",
@@ -344,19 +342,16 @@ static void installSslPinning(JNIEnv* env, jobject context, const std::string& p
         env->DeleteLocalRef(networkSecurityClass);
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
-
     LOGW("SSL pinning installed via JNI: %zu pin(s)", g_sslPins.size());
 }
 
 static bool verifySslPinJni(JNIEnv* env, jobject chain) {
     if (g_sslPins.empty()) return true;
-
     jclass chainClass = env->GetObjectClass(chain);
     jmethodID getSize = env->GetMethodID(chainClass, "size", "()I");
     jmethodID get = env->GetMethodID(chainClass, "get", "(I)Ljava/lang/Object;");
     jint size = env->CallIntMethod(chain, getSize);
     env->DeleteLocalRef(chainClass);
-
     jclass x509Class = env->FindClass("java/security/cert/X509Certificate");
     jmethodID getPublicKey = env->GetMethodID(x509Class, "getPublicKey", "()Ljava/security/PublicKey;");
     jclass keyFactoryClass = env->FindClass("java/security/KeyFactory");
@@ -372,29 +367,24 @@ static bool verifySslPinJni(JNIEnv* env, jobject chain) {
     jmethodID digestMethod = env->GetMethodID(mdClass, "digest", "([B)[B");
     jstring sha256Str = env->NewStringUTF("SHA-256");
     jobject md = env->CallStaticObjectMethod(mdClass, mdGetInstance, sha256Str);
-
     bool matched = false;
     for (jint i = 0; i < size && !matched; i++) {
         jobject cert = env->CallObjectMethod(chain, get, i);
         jobject pubKey = env->CallObjectMethod(cert, getPublicKey);
         jbyteArray encoded = static_cast<jbyteArray>(env->CallObjectMethod(pubKey, getEncoded));
         jbyteArray digest = static_cast<jbyteArray>(env->CallObjectMethod(md, digestMethod, encoded));
-
         jsize dlen = env->GetArrayLength(digest);
         std::vector<uint8_t> dbytes(static_cast<size_t>(dlen));
         env->GetByteArrayRegion(digest, 0, dlen, reinterpret_cast<jbyte*>(dbytes.data()));
         std::string hexPin = bytesToHex(dbytes);
-
         for (const auto& p : g_sslPins) {
             if (p == hexPin) { matched = true; break; }
         }
-
         env->DeleteLocalRef(digest);
         env->DeleteLocalRef(encoded);
         env->DeleteLocalRef(pubKey);
         env->DeleteLocalRef(cert);
     }
-
     env->DeleteLocalRef(sha256Str);
     env->DeleteLocalRef(md);
     env->DeleteLocalRef(mdClass);
@@ -402,7 +392,6 @@ static bool verifySslPinJni(JNIEnv* env, jobject chain) {
     env->DeleteLocalRef(x509SpecClass);
     env->DeleteLocalRef(keyFactoryClass);
     env->DeleteLocalRef(x509Class);
-
     return matched;
 }
 
@@ -421,20 +410,16 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         env->ExceptionClear();
         return false;
     }
-
     jclass ctxClass = env->GetObjectClass(context);
     jmethodID getClassLoader = env->GetMethodID(ctxClass, "getClassLoader",
         "()Ljava/lang/ClassLoader;");
     jobject appLoader = env->CallObjectMethod(context, getClassLoader);
-
     jclass byteBufferClass = env->FindClass("java/nio/ByteBuffer");
     jmethodID wrapMethod = env->GetStaticMethodID(byteBufferClass, "wrap",
         "([B)Ljava/nio/ByteBuffer;");
-
     jclass classCls = env->FindClass("java/lang/Class");
     jobjectArray bufferArray = env->NewObjectArray(
         static_cast<jsize>(dexBlobs.size()), byteBufferClass, nullptr);
-
     for (int i = 0; i < (int)dexBlobs.size(); i++) {
         const auto& blob = dexBlobs[i];
         jbyteArray jBytes = env->NewByteArray(static_cast<jsize>(blob.size()));
@@ -445,7 +430,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         env->DeleteLocalRef(byteBuffer);
         env->DeleteLocalRef(jBytes);
     }
-
     jmethodID inMemoryCtor = env->GetMethodID(inMemoryClass, "<init>",
         "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
     if (!inMemoryCtor || env->ExceptionCheck()) {
@@ -458,7 +442,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         env->DeleteLocalRef(inMemoryClass);
         return false;
     }
-
     jobject tempLoader = env->NewObject(inMemoryClass, inMemoryCtor, bufferArray, appLoader);
     if (!tempLoader || env->ExceptionCheck()) {
         env->ExceptionClear();
@@ -470,7 +453,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         env->DeleteLocalRef(inMemoryClass);
         return false;
     }
-
     jclass fieldCls = env->FindClass("java/lang/reflect/Field");
     jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
         "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
@@ -479,7 +461,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         "(Ljava/lang/Object;)Ljava/lang/Object;");
     jmethodID fieldSet = env->GetMethodID(fieldCls, "set",
         "(Ljava/lang/Object;Ljava/lang/Object;)V");
-
     jclass baseDexClass = env->FindClass("dalvik/system/BaseDexClassLoader");
     jstring pathListName = env->NewStringUTF("pathList");
     jobject pathListField = env->CallObjectMethod(baseDexClass, getDeclaredField, pathListName);
@@ -488,21 +469,17 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         env->CallVoidMethod(pathListField, setAccessible, JNI_TRUE);
         jobject appPathList = env->CallObjectMethod(pathListField, fieldGet, appLoader);
         jobject tempPathList = env->CallObjectMethod(pathListField, fieldGet, tempLoader);
-
         jclass dexPathListClass = env->GetObjectClass(appPathList);
         jstring elemName = env->NewStringUTF("dexElements");
         jobject elemField = env->CallObjectMethod(dexPathListClass, getDeclaredField, elemName);
-
         if (!env->ExceptionCheck() && elemField) {
             env->CallVoidMethod(elemField, setAccessible, JNI_TRUE);
             jobjectArray appElems = static_cast<jobjectArray>(
                 env->CallObjectMethod(elemField, fieldGet, appPathList));
             jobjectArray tempElems = static_cast<jobjectArray>(
                 env->CallObjectMethod(elemField, fieldGet, tempPathList));
-
             jint appLen  = env->GetArrayLength(appElems);
             jint tempLen = env->GetArrayLength(tempElems);
-
             jclass elemClass = env->FindClass("dalvik/system/DexPathList$Element");
             jobjectArray merged = env->NewObjectArray(appLen + tempLen, elemClass, nullptr);
             for (jint i = 0; i < appLen; i++)
@@ -511,11 +488,9 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
             for (jint i = 0; i < tempLen; i++)
                 env->SetObjectArrayElement(merged, appLen + i,
                     env->GetObjectArrayElement(tempElems, i));
-
             env->CallVoidMethod(elemField, fieldSet, appPathList, merged);
             ok = !env->ExceptionCheck();
             if (env->ExceptionCheck()) env->ExceptionClear();
-
             env->DeleteLocalRef(merged);
             env->DeleteLocalRef(elemClass);
             env->DeleteLocalRef(appElems);
@@ -524,7 +499,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
         } else {
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
-
         env->DeleteLocalRef(elemName);
         env->DeleteLocalRef(dexPathListClass);
         env->DeleteLocalRef(appPathList);
@@ -533,7 +507,6 @@ static bool injectDexInMemory(JNIEnv* env, jobject context,
     } else {
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
-
     env->DeleteLocalRef(pathListName);
     env->DeleteLocalRef(baseDexClass);
     env->DeleteLocalRef(fieldCls);
@@ -1105,7 +1078,6 @@ JNIEXPORT void JNICALL
 Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject context) {
     env->GetJavaVM(&g_refs.vm);
     g_refs.applicationContext = env->NewGlobalRef(context);
-
     uint8_t kek[KEK_LEN];
     loadKek(kek);
     uint8_t propsKeyRaw[KEK_LEN + 16];
@@ -1115,7 +1087,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     std::vector<uint8_t> propsKeyInput(propsKeyRaw, propsKeyRaw + sizeof(propsKeyRaw));
     memset(propsKeyRaw, 0, sizeof(propsKeyRaw));
     std::vector<uint8_t> propsKey = sha256Digest(propsKeyInput);
-
     std::vector<uint8_t> encProps = readAssetNative(env, context, "rscoders.bin");
     if (encProps.empty()) tamper("props-missing");
     size_t plainLen = encProps.size() - 12 - 16;
@@ -1123,9 +1094,7 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (!ca::aes256_gcm_decrypt(propsKey.data(), encProps.data(), encProps.size(), plainProps.data()))
         tamper("props-decrypt");
     std::fill(propsKey.begin(), propsKey.end(), 0);
-
     auto props = parseProperties(plainProps);
-
     if (propFlag(props, "guard.debuggingDetection") && beingDebugged()) tamper("debugger");
     if (propFlag(props, "guard.antiPtrace")) installAntiPtrace();
     if (propFlag(props, "guard.antiReverseTools") && reverseToolPresent()) tamper("reverse-tool");
@@ -1133,26 +1102,19 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
     if (propFlag(props, "guard.emulatorDetection") && isEmulator()) tamper("emulator");
     if (propFlag(props, "guard.signatureVerification"))
         verifySignature(env, context, propStr(props, "guard.certSha256"));
-
     std::string payloadAsset = propStr(props, "rscoders.payload", "rscoders.payload");
     std::vector<uint8_t> payload = readAssetNative(env, context, payloadAsset.c_str());
     if (payload.empty()) tamper("payload-missing");
-
     if (propFlag(props, "guard.fileIntegrityVerification"))
         verifyIntegrity(payload, propStr(props, "guard.payloadSha256"));
-
     auto dexBlobs = unpackPayload(payload);
     if (dexBlobs.empty()) tamper("payload-unpack");
-
     injectDex(env, context, dexBlobs);
-
     if (propFlag(props, "guard.sslPinning")) {
         installSslPinning(env, context, propStr(props, "guard.sslPins"));
     }
-
     g_screenCapturePrevention = propFlag(props, "guard.screenCapturePrevention");
     g_antiHijacking = propFlag(props, "guard.antiHijacking");
-
     std::string protectedAssets = propStr(props, "guard.protectedAssets");
     if (!protectedAssets.empty() && !g_assetKey.empty()) {
         if (!g_protected) g_protected = new std::map<std::string, std::vector<uint8_t>>();
@@ -1173,7 +1135,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         }
         if (any) installAssetHook();
     }
-
     std::string protectedSo = propStr(props, "guard.protectedSo");
     if (!protectedSo.empty() && !g_dek.empty()) {
         std::vector<uint8_t> soKeyInput;
@@ -1181,7 +1142,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         const char* soLabel = "rscoders-so";
         soKeyInput.insert(soKeyInput.end(), soLabel, soLabel + strlen(soLabel));
         std::vector<uint8_t> soKey = sha256Digest(soKeyInput);
-
         jclass ctxClass = env->GetObjectClass(context);
         jmethodID getAppInfo = env->GetMethodID(ctxClass, "getApplicationInfo",
             "()Landroid/content/pm/ApplicationInfo;");
@@ -1189,7 +1149,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         jclass aiClass = env->GetObjectClass(appInfo);
         jfieldID sourceDirField = env->GetFieldID(aiClass, "sourceDir", "Ljava/lang/String;");
         jstring sourceDir = static_cast<jstring>(env->GetObjectField(appInfo, sourceDirField));
-
         if (!g_protectedSo) g_protectedSo = new std::map<std::string, std::vector<uint8_t>>();
         std::istringstream ss(protectedSo);
         std::string soName;
@@ -1253,7 +1212,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         env->DeleteLocalRef(ctxClass);
         if (any) installSoHook();
     }
-
     if (propFlag(props, "guard.logSuppression")) {
         static const HookReq reqs[] = {
             {"__android_log_print", reinterpret_cast<void*>(&logPrintNoop)},
@@ -1262,7 +1220,6 @@ Java_com_rscoders_stub_StubApp_nativeBootstrap(JNIEnv* env, jclass, jobject cont
         };
         pltHookAll(reqs, 3);
     }
-
     std::string originalAppClass = propStr(props, "rscoders.originalApplication");
     if (!originalAppClass.empty()) {
         jobject realApp = createRealApp(env, context, originalAppClass);
