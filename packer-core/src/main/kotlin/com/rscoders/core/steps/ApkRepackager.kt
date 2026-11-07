@@ -14,6 +14,7 @@ class ApkRepackager {
         "META-INF/(.*\\.version|com/android/build/.*|.*\\.kotlin_module)",
         RegexOption.IGNORE_CASE,
     )
+    private val nscFile = Regex("res/xml/.*\\.xml", RegexOption.IGNORE_CASE)
 
     fun repackage(
         input: File,
@@ -23,6 +24,7 @@ class ApkRepackager {
         storedEntries: Map<String, ByteArray>,
         deflatedEntries: Map<String, ByteArray>,
         skipEntries: Set<String> = emptySet(),
+        skipNscEntry: Boolean = false,
     ) {
         output.parentFile?.mkdirs()
         val added = HashSet<String>()
@@ -40,6 +42,7 @@ class ApkRepackager {
                     if (buildMetadata.matches(name)) continue
                     if (name in skipEntries) continue
                     if (name in storedEntries || name in deflatedEntries) continue
+                    if (skipNscEntry && nscFile.matches(name)) continue
                     copyEntry(zip, e, out)
                     added += name
                 }
