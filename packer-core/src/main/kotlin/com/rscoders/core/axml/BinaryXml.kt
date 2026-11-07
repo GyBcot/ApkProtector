@@ -12,11 +12,14 @@ object BinaryXml {
     private const val TYPE_START_ELEMENT = 0x0102
     private const val UTF8_FLAG = 0x0100
     private const val ATTR_TYPE_STRING = 0x03
+    private const val ATTR_TYPE_REFERENCE = 0x01
     private const val ANDROID_URI = "http://schemas.android.com/apk/res/android"
+    private const val ANDROID_RES_ID_NAME = 0x0101021B
+    private const val ANDROID_RES_ID_NSC = 0x010104EC
 
     data class Result(val bytes: ByteArray, val originalApplicationClass: String?)
 
-    fun setApplicationName(manifest: ByteArray, stubClass: String): Result {
+    fun setApplicationName(manifest: ByteArray, stubClass: String, nscResId: Int? = null): Result {
         val buf = ByteBuffer.wrap(manifest).order(ByteOrder.LITTLE_ENDIAN)
 
         require(buf.getShort(0).toInt() and 0xFFFF == TYPE_XML) { "not a binary XML file" }
@@ -34,12 +37,29 @@ object BinaryXml {
         val nameIdx = strings.indexOf("name")
         require(nameIdx >= 0) { "no \"name\" string in pool; unusual manifest" }
         val androidUriIdx = strings.indexOf(ANDROID_URI)
+        val nscAttrName = "networkSecurityConfig"
 
-        val stubIdx = stringCount
-        val newPool = appendString(buf, poolOff, poolSize, stringCount, stringsStart, utf8, stubClass)
+        var newPool: ByteArray
+        var stubIdx = stringCount
+        var nscAttrIdx = -1
+        var nscStrIdx = -1
+
+        if (nscResId != null) {
+            val nscResPath = "@xml/rscoders_nsc"
+            newPool = appendString(buf, poolOff, poolSize, stringCount, stringsStart, utf8, stubClass)
+            val poolAfterStub = newPool
+            val countAfterStub = stringCount + 1
+            nscAttrIdx = countAfterStub
+            newPool = appendStringToPool(poolAfterStub, utf8, nscAttrName)
+            nscStrIdx = countAfterStub + 1
+            newPool = appendStringToPool(newPool, utf8, nscResPath)
+        } else {
+            newPool = appendString(buf, poolOff, poolSize, stringCount, stringsStart, utf8, stubClass)
+        }
+
         val tailStart = poolOff + poolSize
         val tail = manifest.copyOfRange(tailStart, manifest.size)
-        val edit = editApplication(tail, strings, nameIdx, androidUriIdx, stubIdx)
+        val edit = editApplication(tail, strings, nameIdx, androidUriIdx, stubIdx, nscResId, nscAttrIdx, nscStrIdx)
         val total = 8 + newPool.size + edit.tail.size
         val out = ByteArrayOutputStream(total)
         val header = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
@@ -58,6 +78,9 @@ object BinaryXml {
         nameIdx: Int,
         androidUriIdx: Int,
         stubIdx: Int,
+        nscResId: Int?,
+        nscAttrIdx: Int,
+        nscStrIdx: Int,
     ): TailEdit {
         val buf = ByteBuffer.wrap(tail).order(ByteOrder.LITTLE_ENDIAN)
         val resMap = readResourceMap(buf, tail.size)
@@ -69,7 +92,7 @@ object BinaryXml {
             if (type == TYPE_START_ELEMENT) {
                 val name = buf.getInt(pos + 20)
                 if (strings.getOrNull(name) == "application") {
-                    return patchElement(tail, pos, strings, nameIdx, androidUriIdx, stubIdx, resMap)
+                    return patchElement(tail, pos, strings, nameIdx, androidUriIdx, stubIdx, resMap, nscResId, nscAttrIdx, nscStrIdx)
                 }
             }
             pos += size
@@ -101,56 +124,98 @@ object BinaryXml {
         androidUriIdx: Int,
         stubIdx: Int,
         resMap: IntArray,
+        nscResId: Int?,
+        nscAttrIdx: Int,
+        nscStrIdx: Int,
     ): TailEdit {
         val buf = ByteBuffer.wrap(tail).order(ByteOrder.LITTLE_ENDIAN)
         val attrCount = buf.getShort(elem + 28).toInt() and 0xFFFF
         val attrsStart = elem + 36
+
+        var originalClass: String? = null
+        var namePatched = false
 
         for (i in 0 until attrCount) {
             val a = attrsStart + i * 20
             val ns = buf.getInt(a)
             val nm = buf.getInt(a + 4)
             if (nm == nameIdx && ns == androidUriIdx) {
-                val original = strings.getOrNull(buf.getInt(a + 16))
+                originalClass = strings.getOrNull(buf.getInt(a + 16))
                 buf.putInt(a + 8, stubIdx)
                 buf.putInt(a + 16, stubIdx)
-                return TailEdit(tail, original)
+                namePatched = true
+                break
             }
         }
 
-        require(androidUriIdx >= 0) { "android namespace URI missing; cannot insert android:name" }
-        val newResId = resMap.getOrElse(nameIdx) { 0 }
-        var insIdx = attrCount
-        for (i in 0 until attrCount) {
-            val attrNameIdx = buf.getInt(attrsStart + i * 20 + 4)
-            val resId = resMap.getOrElse(attrNameIdx) { 0 }
-            val sortsAfterNew = (resId == 0) || (java.lang.Integer.compareUnsigned(resId, newResId) > 0)
-            if (sortsAfterNew) { insIdx = i; break }
+        var workingTail = tail
+        var workingBuf = ByteBuffer.wrap(workingTail).order(ByteOrder.LITTLE_ENDIAN)
+        var currentAttrCount = attrCount
+
+        if (!namePatched) {
+            require(androidUriIdx >= 0) { "android namespace URI missing; cannot insert android:name" }
+            val newResId = resMap.getOrElse(nameIdx) { 0 }
+            var insIdx = currentAttrCount
+            for (i in 0 until currentAttrCount) {
+                val attrNameIdx = workingBuf.getInt(attrsStart + i * 20 + 4)
+                val resId = resMap.getOrElse(attrNameIdx) { 0 }
+                if ((resId == 0) || (java.lang.Integer.compareUnsigned(resId, newResId) > 0)) {
+                    insIdx = i; break
+                }
+            }
+            val insertAt = attrsStart + insIdx * 20
+            val attr = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+            attr.putInt(androidUriIdx)
+            attr.putInt(nameIdx)
+            attr.putInt(stubIdx)
+            attr.putShort(8)
+            attr.put(0)
+            attr.put(ATTR_TYPE_STRING.toByte())
+            attr.putInt(stubIdx)
+            val out = ByteArray(workingTail.size + 20)
+            System.arraycopy(workingTail, 0, out, 0, insertAt)
+            System.arraycopy(attr.array(), 0, out, insertAt, 20)
+            System.arraycopy(workingTail, insertAt, out, insertAt + 20, workingTail.size - insertAt)
+            workingTail = out
+            workingBuf = ByteBuffer.wrap(workingTail).order(ByteOrder.LITTLE_ENDIAN)
+            workingBuf.putInt(elem + 4, workingBuf.getInt(elem + 4) + 20)
+            currentAttrCount++
+            workingBuf.putShort(elem + 28, currentAttrCount.toShort())
+            for (off in intArrayOf(30, 32, 34)) {
+                val si = workingBuf.getShort(elem + off).toInt() and 0xFFFF
+                if (si != 0 && si > insIdx) workingBuf.putShort(elem + off, (si + 1).toShort())
+            }
         }
-        val insertAt = attrsStart + insIdx * 20
 
-        val attr = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
-        attr.putInt(androidUriIdx)
-        attr.putInt(nameIdx)        
-        attr.putInt(stubIdx)       
-        attr.putShort(8)            
-        attr.put(0)                   
-        attr.put(ATTR_TYPE_STRING.toByte())
-        attr.putInt(stubIdx)    
-
-        val out = ByteArray(tail.size + 20)
-        System.arraycopy(tail, 0, out, 0, insertAt)
-        System.arraycopy(attr.array(), 0, out, insertAt, 20)
-        System.arraycopy(tail, insertAt, out, insertAt + 20, tail.size - insertAt)
-
-        val ob = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
-        ob.putInt(elem + 4, buf.getInt(elem + 4) + 20)    
-        ob.putShort(elem + 28, (attrCount + 1).toShort()) 
-        for (off in intArrayOf(30, 32, 34)) {
-            val si = buf.getShort(elem + off).toInt() and 0xFFFF
-            if (si != 0 && si > insIdx) ob.putShort(elem + off, (si + 1).toShort())
+        if (nscResId != null) {
+            val nscResIdInt = nscResId
+            val existingNscAttr = (0 until currentAttrCount).any { i ->
+                val a = attrsStart + i * 20
+                workingBuf.getInt(a + 4) == nscAttrIdx
+            }
+            if (!existingNscAttr) {
+                val insertAt = attrsStart + currentAttrCount * 20
+                val attr = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+                attr.putInt(androidUriIdx)
+                attr.putInt(nscAttrIdx)
+                attr.putInt(nscStrIdx)
+                attr.putShort(8)
+                attr.put(0)
+                attr.put(ATTR_TYPE_REFERENCE.toByte())
+                attr.putInt(nscResIdInt)
+                val out = ByteArray(workingTail.size + 20)
+                System.arraycopy(workingTail, 0, out, 0, insertAt)
+                System.arraycopy(attr.array(), 0, out, insertAt, 20)
+                System.arraycopy(workingTail, insertAt, out, insertAt + 20, workingTail.size - insertAt)
+                workingTail = out
+                workingBuf = ByteBuffer.wrap(workingTail).order(ByteOrder.LITTLE_ENDIAN)
+                workingBuf.putInt(elem + 4, workingBuf.getInt(elem + 4) + 20)
+                currentAttrCount++
+                workingBuf.putShort(elem + 28, currentAttrCount.toShort())
+            }
         }
-        return TailEdit(out, null)
+
+        return TailEdit(workingTail, originalClass)
     }
 
     private fun readStrings(
@@ -216,30 +281,57 @@ object BinaryXml {
         val oldOffsetsBase = poolOff + 28
         val oldDataBase = poolOff + stringsStart
         val oldDataLen = poolSize - stringsStart
-
         val encoded = if (utf8) encodeUtf8(newString) else encodeUtf16(newString)
-
         val newCount = count + 1
         val newStringsStart = 28 + newCount * 4
         var dataLen = oldDataLen + encoded.size
         val pad = (4 - (newStringsStart + dataLen) % 4) % 4
         dataLen += pad
         val newPoolSize = newStringsStart + dataLen
-
         val out = ByteBuffer.allocate(newPoolSize).order(ByteOrder.LITTLE_ENDIAN)
         out.putShort(TYPE_STRING_POOL.toShort())
         out.putShort(28)
         out.putInt(newPoolSize)
         out.putInt(newCount)
-        out.putInt(0)                       
-        out.putInt(buf.getInt(poolOff + 16)) 
-        out.putInt(newStringsStart)       
-        out.putInt(0)                     
-
+        out.putInt(0)
+        out.putInt(buf.getInt(poolOff + 16))
+        out.putInt(newStringsStart)
+        out.putInt(0)
         for (i in 0 until count) out.putInt(buf.getInt(oldOffsetsBase + i * 4))
         out.putInt(oldDataLen)
-
         for (i in 0 until oldDataLen) out.put(buf.get(oldDataBase + i))
+        out.put(encoded)
+        repeat(pad) { out.put(0) }
+        return out.array()
+    }
+
+    private fun appendStringToPool(pool: ByteArray, utf8: Boolean, newString: String): ByteArray {
+        val poolBuf = ByteBuffer.wrap(pool).order(ByteOrder.LITTLE_ENDIAN)
+        val poolSize = poolBuf.getInt(4)
+        val count = poolBuf.getInt(8)
+        val stringsStart = poolBuf.getInt(20)
+        val flags = poolBuf.getInt(16)
+        val oldDataBase = stringsStart
+        val oldDataLen = poolSize - stringsStart
+        val encoded = if (utf8) encodeUtf8(newString) else encodeUtf16(newString)
+        val newCount = count + 1
+        val newStringsStart = 28 + newCount * 4
+        var dataLen = oldDataLen + encoded.size
+        val pad = (4 - (newStringsStart + dataLen) % 4) % 4
+        dataLen += pad
+        val newPoolSize = newStringsStart + dataLen
+        val out = ByteBuffer.allocate(newPoolSize).order(ByteOrder.LITTLE_ENDIAN)
+        out.putShort(TYPE_STRING_POOL.toShort())
+        out.putShort(28)
+        out.putInt(newPoolSize)
+        out.putInt(newCount)
+        out.putInt(0)
+        out.putInt(flags)
+        out.putInt(newStringsStart)
+        out.putInt(0)
+        for (i in 0 until count) out.putInt(poolBuf.getInt(28 + i * 4))
+        out.putInt(oldDataLen)
+        for (i in 0 until oldDataLen) out.put(pool[oldDataBase + i])
         out.put(encoded)
         repeat(pad) { out.put(0) }
         return out.array()
@@ -257,7 +349,7 @@ object BinaryXml {
         val bytes = s.toByteArray(Charsets.UTF_8)
         val out = ByteArrayOutputStream()
         out.write(s.length and 0xFF)
-        out.write(bytes.size and 0xFF) 
+        out.write(bytes.size and 0xFF)
         out.write(bytes)
         out.write(0)
         return out.toByteArray()
