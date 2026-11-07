@@ -184,9 +184,10 @@ static void poly1305_tag(const uint8_t *msg, size_t msglen, uint8_t out[16]) {
     h0=(h0&~mask)|(g0&mask); h1=(h1&~mask)|(g1&mask);
     h2=(h2&~mask)|(g2&mask); h3=(h3&~mask)|(g3&mask);
     h4=(h4&~mask)|(g4&mask);
-    uint32_t f0,f1,f2,f3;
-    f0 = (h0|(h1<<26)) + s0; f1 = ((h1>>6)|(h2<<20)) + s1 + (f0>>32);
-    f2 = ((h2>>12)|(h3<<14)) + s2 + (f1>>32); f3 = ((h3>>18)|(h4<<8)) + s3 + (f2>>32);
+    uint64_t f0 = ((uint64_t)h0 | ((uint64_t)h1 << 26)) + (uint64_t)s0;
+    uint64_t f1 = (((uint64_t)h1 >> 6) | ((uint64_t)h2 << 20)) + (uint64_t)s1 + (f0 >> 32);
+    uint64_t f2 = (((uint64_t)h2 >> 12) | ((uint64_t)h3 << 14)) + (uint64_t)s2 + (f1 >> 32);
+    uint64_t f3 = (((uint64_t)h3 >> 18) | ((uint64_t)h4 << 8)) + (uint64_t)s3 + (f2 >> 32);
     out[0]=(uint8_t)f0; out[1]=(uint8_t)(f0>>8); out[2]=(uint8_t)(f0>>16); out[3]=(uint8_t)(f0>>24);
     out[4]=(uint8_t)f1; out[5]=(uint8_t)(f1>>8); out[6]=(uint8_t)(f1>>16); out[7]=(uint8_t)(f1>>24);
     out[8]=(uint8_t)f2; out[9]=(uint8_t)(f2>>8); out[10]=(uint8_t)(f2>>16); out[11]=(uint8_t)(f2>>24);
